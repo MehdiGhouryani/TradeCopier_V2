@@ -465,30 +465,78 @@ async def copy_add_receive_name(update: Update, context: ContextTypes.DEFAULT_TY
     )
     return COPY_ID_STR
 
+
+
+
+
+
 async def copy_add_receive_id_str(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دریافت Copy ID Str، اعتبارسنجی، ذخیره موقت و پرسیدن DD%."""
+    """دریافت Copy ID Str، اعتبارسنجی فرمت و یکتایی آن در دیتابیس، و رفتن به مرحله بعد."""
     user = update.effective_user
     copy_id_str = update.message.text.strip()
-    # اعتبارسنجی اولیه (می‌تواند کامل‌تر باشد)
-    if not copy_id_str or not copy_id_str.isalnum() or ' ' in copy_id_str:
-         await update.message.reply_text("❌ شناسه نامعتبر است. فقط از حروف انگلیسی و اعداد بدون فاصله استفاده کنید. (مثال: `CA2`).\nلطفاً دوباره وارد کنید یا با /cancel لغو کنید.", parse_mode=ParseMode.MARKDOWN_V2)
+    
+    log_extra = {
+        'user_id': user.id, 
+        'input_for': 'COPY_ID_STR', 
+        'text_received': copy_id_str,
+        'status': 'validation'
+    }
+
+    # --- اعتبارسنجی فرمت (اجازه حروف، اعداد و آندرلاین) ---
+    is_valid_format = all(c.isalnum() or c == '_' for c in copy_id_str) and ' ' not in copy_id_str and copy_id_str
+    
+    if not is_valid_format:
+         log_extra['status'] = 'failed_format_validation'
+         logger.warning("Invalid Copy ID Str format received.", extra=log_extra)
+         await update.message.reply_text(
+             "❌ شناسه نامعتبر است. فقط از حروف انگلیسی، اعداد و آندرلاین (_) بدون فاصله استفاده کنید. (مثال: `CA_2`).\n"
+             "لطفاً دوباره وارد کنید یا با /cancel لغو کنید.", 
+             parse_mode=ParseMode.MARKDOWN_V2
+         )
          return COPY_ID_STR
 
-    log_extra = {'user_id': user.id, 'input_for': 'COPY_ID_STR', 'text_received': copy_id_str}
+    # --- اعتبارسنجی یکتایی (Uniqueness) ---
+    try:
+        is_unique = database.is_copy_id_str_unique(copy_id_str)
+        
+        if not is_unique:
+            log_extra['status'] = 'failed_uniqueness_validation'
+            logger.warning("Duplicate Copy ID Str received.", extra=log_extra)
+            await update.message.reply_text(
+                f"❌ شناسه `{escape_markdown(copy_id_str, 2)}` قبلاً استفاده شده است.\n"
+                "لطفاً شناسه منحصر به فرد دیگری وارد کنید یا با /cancel لغو کنید.",
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+            return COPY_ID_STR
 
-    # TODO: بررسی یکتایی copy_id_str در دیتابیس (نیاز به تابع در database.py)
-    # if not database.is_copy_id_str_unique(copy_id_str):
-    #     await update.message.reply_text(f"❌ شناسه '{escape_markdown(copy_id_str, 2)}' قبلاً استفاده شده است. لطفاً شناسه دیگری وارد کنید یا با /cancel لغو کنید.", parse_mode=ParseMode.MARKDOWN_V2)
-    #     return COPY_ID_STR
+    except Exception as e:
+        log_extra['status'] = 'failed_db_check'
+        log_extra['error'] = str(e)
+        logger.error("Failed to check Copy ID Str uniqueness in database.", exc_info=True, extra=log_extra)
+        await update.message.reply_text(
+            "❌ خطایی در ارتباط با دیتابیس هنگام بررسی شناسه رخ داد.\n"
+            "لطفاً با /cancel لغو کرده و مجدداً تلاش کنید.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return ConversationHandler.END
 
+    # --- موفقیت ---
     context.user_data['new_copy_id_str'] = copy_id_str
-    logger.debug("Received copy_id_str, waiting for dd_percent.", extra=log_extra)
+    log_extra['status'] = 'success'
+    logger.info("Received and validated unique copy_id_str, waiting for dd_percent.", extra=log_extra)
+    
     await update.message.reply_text(
-        "۳/۳: لطفاً درصد حد ضرر روزانه (Daily Drawdown Percent) را وارد کنید (عدد مثبت، مثال: `5.0`).\nبرای غیرفعال کردن عدد `0` را وارد کنید.",
+        "۳/۳: لطفاً درصد حد ضرر روزانه (Daily Drawdown Percent) را وارد کنید (عدد مثبت، مثال: `5.0`).\n"
+        "برای غیرفعال کردن عدد `0` را وارد کنید.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 لغو", callback_data="copy:main")]]),
         parse_mode=ParseMode.MARKDOWN_V2
     )
     return COPY_DD
+
+
+
+
+
 
 async def copy_add_receive_dd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """دریافت DD%، ذخیره حساب کپی جدید در دیتابیس و پایان گفتگو."""
@@ -761,35 +809,50 @@ async def copy_delete_execute(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 # --- منو و Conversation: ویرایش تنظیمات حساب کپی ---
 
+
+
 @admin_only
 async def copy_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """نمایش منوی تنظیمات (DD%, Alert%) برای حساب کپی انتخاب شده."""
+    """نمایش منوی تنظیمات (DD%, Alert%) و دکمه ریست DD برای حساب کپی."""
     query = update.callback_query
     await query.answer()
+    
+    # اطمینان از وجود copy_id چه از user_data (اگر در گفتگو بودیم) یا از query.data
     copy_id = context.user_data.get('selected_copy_id')
     if not copy_id:
-         await query.edit_message_text("❌ خطای داخلی: ID حساب کپی یافت نشد.")
-         return ConversationHandler.END # از هر گفتگویی خارج شو
+        try:
+            copy_id = int(query.data.split(':')[-1])
+            context.user_data['selected_copy_id'] = copy_id
+        except (IndexError, ValueError):
+            logger.error(f"Invalid callback data for copy_settings_menu: {query.data}", extra={'user_id': update.effective_user.id})
+            await query.edit_message_text("❌ خطای داخلی: ID حساب کپی یافت نشد.")
+            return ConversationHandler.END
 
     settings = None
     copy_name = "حساب کپی"
+    log_extra = {'user_id': update.effective_user.id, 'entity_id': copy_id}
+
     try:
         with database.get_db_session() as db:
-            # خواندن تنظیمات
             copy_account = db.query(database.CopyAccount)\
                              .options(joinedload(database.CopyAccount.settings))\
                              .filter(database.CopyAccount.id == copy_id).first()
             if copy_account:
                 copy_name = copy_account.name
                 settings = copy_account.settings
+            else:
+                logger.warning(f"Copy account (ID: {copy_id}) not found during settings menu load.", extra=log_extra)
+                await query.edit_message_text("❌ حساب کپی مورد نظر یافت نشد (ممکن است حذف شده باشد).")
+                return ConversationHandler.END
+
     except Exception as e:
-        logger.error(f"Failed to query copy settings (ID: {copy_id})", exc_info=True)
+        log_extra['error'] = str(e)
+        logger.error(f"Failed to query copy settings (ID: {copy_id})", exc_info=True, extra=log_extra)
         await query.edit_message_text("❌ خطایی در خواندن تنظیمات رخ داد.")
         return ConversationHandler.END
 
     if not settings:
-         # این حالت نباید اتفاق بیفتد چون هنگام افزودن، تنظیمات ساخته می‌شود
-         logger.error(f"Settings not found for copy account ID: {copy_id}")
+         logger.error(f"Settings relationship not found for copy account (ID: {copy_id})", extra=log_extra)
          await query.edit_message_text("❌ خطای داخلی: تنظیمات حساب یافت نشد.")
          return ConversationHandler.END
 
@@ -797,9 +860,9 @@ async def copy_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     alert_percent = settings.alert_drawdown_percent
 
     keyboard = [
-        [InlineKeyboardButton(f"حد ضرر روزانه: {dd_percent:.2f}%", callback_data=f"copy:settings:edit_dd:start:{copy_id}")],
-        [InlineKeyboardButton(f"حد هشدار روزانه: {alert_percent:.2f}%", callback_data=f"copy:settings:edit_alert:start:{copy_id}")],
-        # TODO: دکمه ریست فلگ DD در آینده
+        [InlineKeyboardButton(f"✏️ حد ضرر روزانه: {dd_percent:.2f}%", callback_data=f"copy:settings:edit_dd:start:{copy_id}")],
+        [InlineKeyboardButton(f"✏️ حد هشدار روزانه: {alert_percent:.2f}%", callback_data=f"copy:settings:edit_alert:start:{copy_id}")],
+        [InlineKeyboardButton("🔄 بازنشانی حد ضرر روزانه (Reset DD)", callback_data=f"copy:settings:reset_dd:{copy_id}")],
         [InlineKeyboardButton("🔙 بازگشت به منوی حساب", callback_data=f"copy:select:{copy_id}")]
     ]
 
@@ -808,7 +871,51 @@ async def copy_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.MARKDOWN_V2
     )
-    return ConversationHandler.END # اگر در گفتگویی بودیم خارج شو
+    return ConversationHandler.END
+
+
+@admin_only
+async def copy_settings_reset_dd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """پردازش دکمه بازنشانی حد ضرر روزانه (Reset DD Flag)."""
+    query = update.callback_query
+    
+    try:
+        copy_id = int(query.data.split(':')[-1])
+        context.user_data['selected_copy_id'] = copy_id
+    except (IndexError, ValueError):
+         logger.error(f"Invalid callback data for reset_dd: {query.data}", extra={'user_id': update.effective_user.id})
+         await query.answer("❌ خطای داخلی: ID حساب نامعتبر است.", show_alert=True)
+         return
+
+    log_extra = {'user_id': update.effective_user.id, 'entity_id': copy_id, 'action': 'reset_dd_flag'}
+
+    try:
+        success = database.update_copy_settings(copy_id=copy_id, settings_data={'reset_dd_flag': True})
+
+        if success:
+            logger.info("Daily Drawdown flag reset successfully.", extra=log_extra)
+            await query.answer(
+                "✅ فلگ حد ضرر روزانه بازنشانی شد.\n"
+                "اکسپرت کپی در چرخه بعدی تنظیمات، مجوز فعالیت مجدد را دریافت خواهد کرد.",
+                show_alert=True
+            )
+            # رفرش کردن منو برای اطمینان
+            await copy_settings_menu(update, context)
+        
+        else:
+             logger.warning("Failed to reset DD flag (copy account not found).", extra=log_extra)
+             await query.answer("⚠️ حساب کپی مورد نظر یافت نشد.", show_alert=True)
+
+    except Exception as e:
+        log_extra['error'] = str(e)
+        logger.error(f"Failed to execute reset_dd_flag due to database error.", exc_info=True, extra=log_extra)
+        await query.answer(f"❌ خطایی در هنگام ارتباط با دیتابیس رخ داد:\n{e}", show_alert=True)
+
+
+
+
+
+
 
 @admin_only
 async def copy_settings_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1180,34 +1287,80 @@ async def conn_disconnect_execute(update: Update, context: ContextTypes.DEFAULT_
 
 @admin_only
 async def conn_set_volume_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """نمایش دکمه‌های انتخاب نوع حجم (Multiplier/Fixed)."""
+    """نمایش دکمه‌های انتخاب نوع حجم (Multiplier/Fixed) همراه با نمایش مقدار فعلی."""
     query = update.callback_query
     await query.answer()
+    
+    log_extra = {'user_id': update.effective_user.id}
+    mapping_id = None
+    
     try:
-        # ID رکورد mapping از callback_data استخراج می‌شود
         mapping_id = int(query.data.split(':')[-1])
-        # ذخیره mapping_id برای استفاده در مراحل بعدی گفتگو
         context.user_data['selected_mapping_id'] = mapping_id
+        log_extra['entity_id'] = mapping_id
+        
     except (IndexError, ValueError):
-        logger.error(f"Invalid callback data for conn_set_volume_type: {query.data}")
-        await query.edit_message_text("❌ خطای داخلی: داده نامعتبر است\\.")
+        log_extra['callback_data'] = query.data
+        logger.error("Invalid callback data for conn_set_volume_type: mapping_id missing.", extra=log_extra)
+        await query.edit_message_text("❌ خطای داخلی: شناسه اتصال نامعتبر است\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return ConversationHandler.END
 
-    # TODO: خواندن مقدار فعلی از دیتابیس برای نمایش بهتر (اختیاری)
-    # mapping_info = database.get_mapping_by_id(mapping_id)
-    # current_type = mapping_info.get('volume_type', 'MULTIPLIER')
+    current_type = "N/A"
+    current_value = 0.0
+    copy_id_for_cancel = context.user_data.get('selected_copy_id', '')
+
+    try:
+        # فراخوانی دیتابیس برای دریافت اطلاعات فعلی
+        mapping_info = database.get_mapping_by_id(mapping_id)
+        
+        if not mapping_info:
+            logger.warning(f"Mapping not found (ID: {mapping_id}) when trying to edit volume type.", extra=log_extra)
+            # دکمه بازگشت به منوی اتصالات (اگر copy_id را داشتیم)
+            cancel_button = [InlineKeyboardButton("🔙 بازگشت", callback_data=f"conn:select_copy:{copy_id_for_cancel}")] if copy_id_for_cancel else []
+            await query.edit_message_text(
+                "❌ اتصال مورد نظر یافت نشد (ممکن است حذف شده باشد)\\.",
+                reply_markup=InlineKeyboardMarkup([cancel_button]),
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+            return ConversationHandler.END
+        
+        current_type = mapping_info.volume_type
+        current_value = mapping_info.volume_value
+        log_extra['details'] = {'current_type': current_type, 'current_value': current_value}
+
+    except Exception as e:
+        log_extra['error'] = str(e)
+        logger.error(f"Failed to fetch mapping info for volume type edit (ID: {mapping_id}).", exc_info=True, extra=log_extra)
+        await query.edit_message_text(
+            f"❌ خطایی در خواندن اطلاعات اتصال رخ داد: {escape_markdown(str(e), 2)}",
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return ConversationHandler.END
+
+    prompt_text = (
+        f"⚙️ *تنظیمات حجم*\n\n"
+        f"مقدار فعلی: *{escape_markdown(current_type, 2)}* با مقدار `{current_value:.2f}`\n\n"
+        "لطفاً نوع جدید محاسبه حجم را انتخاب کنید:"
+    )
 
     keyboard = [
         [InlineKeyboardButton("ضریب (Multiplier)", callback_data=f"conn:set_volume_value:mult:{mapping_id}")],
         [InlineKeyboardButton("حجم ثابت (Fixed)", callback_data=f"conn:set_volume_value:fixed:{mapping_id}")],
-        [InlineKeyboardButton("🔙 لغو", callback_data=f"conn:cancel_edit:{mapping_id}")] # دکمه لغو جدید
+        [InlineKeyboardButton("🔙 لغو و بازگشت", callback_data=f"conn:cancel_edit:{mapping_id}")]
     ]
+    
     await query.edit_message_text(
-        "لطفاً نوع محاسبه حجم برای این اتصال را انتخاب کنید:",
+        prompt_text,
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.MARKDOWN_V2
     )
-    # چون این تابع ورودی ConversationHandler نیست، state برنمی‌گردانیم
+    
+    logger.info("Displayed volume type selection menu with current values.", extra=log_extra)
+    # این تابع فقط دکمه‌ها را نمایش می‌دهد و وارد State نمی‌شود
+    # دکمه‌های بالا، هندلر conn_set_volume_value_start را فراخوانی می‌کنند
+    return
+
+
 
 @admin_only
 async def conn_set_volume_value_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1343,33 +1496,93 @@ async def conn_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def conn_set_mode_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """نمایش دکمه‌های انتخاب حالت کپی (ALL/GOLD_ONLY/SYMBOLS)."""
+    """نمایش دکمه‌های انتخاب حالت کپی (ALL/GOLD_ONLY/SYMBOLS) همراه با نمایش حالت فعلی."""
     query = update.callback_query
     await query.answer()
+    
+    log_extra = {'user_id': update.effective_user.id}
+    mapping_id = None
+
     try:
         mapping_id = int(query.data.split(':')[-1])
         context.user_data['selected_mapping_id'] = mapping_id
+        log_extra['entity_id'] = mapping_id
+        
     except (IndexError, ValueError):
-        logger.error(f"Invalid callback data for conn_set_mode_menu: {query.data}")
-        await query.edit_message_text("❌ خطای داخلی: داده نامعتبر است\\.")
-        return ConversationHandler.END # اگر در گفتگویی بودیم
+        log_extra['callback_data'] = query.data
+        logger.error("Invalid callback data for conn_set_mode_menu: mapping_id missing.", extra=log_extra)
+        await query.edit_message_text("❌ خطای داخلی: شناسه اتصال نامعتبر است\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        return ConversationHandler.END
 
-    # TODO: خواندن حالت فعلی از دیتابیس (اختیاری)
-    # mapping_info = database.get_mapping_by_id(mapping_id)
-    # current_mode = mapping_info.get('copy_mode', 'ALL')
+    current_mode = "N/A"
+    current_symbols = None
+    copy_id_for_cancel = context.user_data.get('selected_copy_id', '')
+
+    try:
+        # فراخوانی دیتابیس برای دریافت اطلاعات فعلی
+        mapping_info = database.get_mapping_by_id(mapping_id)
+        
+        if not mapping_info:
+            logger.warning(f"Mapping not found (ID: {mapping_id}) when trying to edit copy mode.", extra=log_extra)
+            cancel_button = [InlineKeyboardButton("🔙 بازگشت", callback_data=f"conn:select_copy:{copy_id_for_cancel}")] if copy_id_for_cancel else []
+            await query.edit_message_text(
+                "❌ اتصال مورد نظر یافت نشد (ممکن است حذف شده باشد)\\.",
+                reply_markup=InlineKeyboardMarkup([cancel_button]),
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+            return ConversationHandler.END
+        
+        current_mode = mapping_info.copy_mode
+        current_symbols = mapping_info.allowed_symbols
+        
+        # لاگ‌نویسی فشرده مطابق درخواست
+        log_extra['details'] = {'current_mode': current_mode, 'current_symbols': current_symbols}
+        logger.info("Fetched current copy_mode. Displaying selection menu.", extra=log_extra)
+
+    except Exception as e:
+        log_extra['error'] = str(e)
+        logger.error(f"Failed to fetch mapping info for copy mode edit (ID: {mapping_id}).", exc_info=True, extra=log_extra)
+        await query.edit_message_text(
+            f"❌ خطایی در خواندن اطلاعات اتصال رخ داد: {escape_markdown(str(e), 2)}",
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return ConversationHandler.END
+
+    # --- آماده‌سازی متن پیام بر اساس حالت فعلی ---
+    prompt_header = "🚦 *تنظیمات حالت کپی نمادها*\n\n"
+    status_text = ""
+    
+    if current_mode == "SYMBOLS" and current_symbols:
+        status_text = (
+            f"حالت فعلی: *SYMBOLS*\n"
+            f"نمادهای مجاز: `{escape_markdown(current_symbols, 2)}`\n\n"
+        )
+    elif current_mode == "GOLD_ONLY":
+        status_text = "حالت فعلی: *GOLD_ONLY* (فقط طلا)\n\n"
+    else:
+        status_text = "حالت فعلی: *ALL* (همه نمادها)\n\n"
+
+    prompt_footer = "لطفاً حالت کپی جدید را انتخاب کنید:"
+    final_prompt = prompt_header + status_text + prompt_footer
 
     keyboard = [
         [InlineKeyboardButton("1️⃣ همه نمادها (ALL)", callback_data=f"conn:set_mode_action:ALL:{mapping_id}")],
         [InlineKeyboardButton("2️⃣ فقط طلا (GOLD_ONLY)", callback_data=f"conn:set_mode_action:GOLD_ONLY:{mapping_id}")],
         [InlineKeyboardButton("3️⃣ نمادهای خاص (SYMBOLS)", callback_data=f"conn:set_mode_action:SYMBOLS:{mapping_id}")],
-        [InlineKeyboardButton("🔙 لغو", callback_data=f"conn:cancel_edit:{mapping_id}")]
+        [InlineKeyboardButton("🔙 لغو و بازگشت", callback_data=f"conn:cancel_edit:{mapping_id}")]
     ]
+    
     await query.edit_message_text(
-        "لطفاً حالت کپی نمادها برای این اتصال را انتخاب کنید:",
+        final_prompt,
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.MARKDOWN_V2
     )
-    # چون این تابع ورودی ConversationHandler نیست، state برنمی‌گردانیم
+    
+    # این تابع فقط دکمه‌ها را نمایش می‌دهد و وارد State نمی‌شود
+    # دکمه‌های بالا، هندلر conn_set_mode_action را فراخوانی می‌کنند
+    return
+
+
 
 @admin_only
 async def conn_set_mode_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1492,57 +1705,111 @@ async def conn_set_symbols_receive(update: Update, context: ContextTypes.DEFAULT
 
 
 
-
-# CoreService/core/telegram_bot.py
-
-# ... (تابع conn_set_symbols_receive) ...
-
 # --- Conversation: ویرایش محدودیت‌های امنیتی اتصال ---
+
 
 @admin_only
 async def conn_set_limit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """شروع گفتگو برای دریافت مقدار محدودیت امنیتی."""
+    """شروع گفتگو برای دریافت مقدار محدودیت امنیتی، همراه با نمایش مقدار فعلی."""
     query = update.callback_query
     await query.answer()
+    
+    log_extra = {'user_id': update.effective_user.id}
+    mapping_id = None
+    limit_type = None
+
     try:
         parts = query.data.split(':')
         limit_type = parts[4] # 'max_lot', 'max_trades', 'dd_limit'
         mapping_id = int(parts[5])
-        # ذخیره نوع و ID در user_data
+        
         context.user_data['selected_mapping_id'] = mapping_id
         context.user_data['editing_limit_type'] = limit_type
+        
+        log_extra['entity_id'] = mapping_id
+        log_extra['details'] = {'limit_type': limit_type}
+
     except (IndexError, ValueError):
-        logger.error(f"Invalid callback data for conn_set_limit_start: {query.data}")
-        await query.edit_message_text("❌ خطای داخلی: داده نامعتبر است\\.")
+        log_extra['callback_data'] = query.data
+        logger.error(f"Invalid callback data for conn_set_limit_start: {query.data}", extra=log_extra)
+        await query.edit_message_text("❌ خطای داخلی: داده‌های شناسه اتصال یا نوع محدودیت نامعتبر است\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return ConversationHandler.END
 
-    # TODO: خواندن مقدار فعلی از دیتابیس (اختیاری)
-    # mapping_info = database.get_mapping_by_id(mapping_id)
-    # current_value = mapping_info.get(database_key_map[limit_type], 0.0)
-
+    current_value = 0.0
     prompt_text = ""
     example = ""
-    if limit_type == "max_lot":
-        prompt_text = "حداکثر حجم مجاز \\(Max Lot Size\\) برای هر معامله از این سورس را وارد کنید \\(عدد بزرگتر مساوی صفر\\)\\. عدد `0` به معنی نامحدود است\\."
-        example = "مثال: `1.5` یا `0`"
-    elif limit_type == "max_trades":
-        prompt_text = "حداکثر تعداد معاملات باز همزمان \\(Max Concurrent Trades\\) از این سورس را وارد کنید \\(عدد صحیح بزرگتر مساوی صفر\\)\\. عدد `0` به معنی نامحدود است\\."
-        example = "مثال: `3` یا `0`"
-    elif limit_type == "dd_limit":
-        prompt_text = f"حد ضرر شناور \\(Source Drawdown Limit\\) برای *مجموع معاملات باز* این سورس را به واحد پولی حساب وارد کنید \\(عدد بزرگتر مساوی صفر\\)\\. عدد `0` به معنی نامحدود است\\."
-        example = "مثال: `200.0` یا `0`"
-    else:
-         await query.edit_message_text("❌ خطای داخلی: نوع محدودیت نامعتبر است\\.")
-         return ConversationHandler.END
+    status_text = ""
+    copy_id_for_cancel = context.user_data.get('selected_copy_id', '')
 
+    try:
+        # --- گام جدید: خواندن مقدار فعلی از دیتابیس ---
+        mapping_info = database.get_mapping_by_id(mapping_id)
+        if not mapping_info:
+            logger.warning(f"Mapping not found (ID: {mapping_id}) when trying to edit limit {limit_type}.", extra=log_extra)
+            cancel_button = [InlineKeyboardButton("🔙 بازگشت", callback_data=f"conn:select_copy:{copy_id_for_cancel}")] if copy_id_for_cancel else []
+            await query.edit_message_text(
+                "❌ اتصال مورد نظر یافت نشد (ممکن است حذف شده باشد)\\.",
+                reply_markup=InlineKeyboardMarkup([cancel_button]),
+                parse_mode=ParseMode.MARKDOWN_V2
+            )
+            return ConversationHandler.END
+
+        # --- استخراج مقدار فعلی بر اساس نوع محدودیت ---
+        if limit_type == "max_lot":
+            current_value = mapping_info.max_lot_size
+            prompt_text = "حداکثر حجم مجاز \\(Max Lot Size\\) برای هر معامله از این سورس را وارد کنید \\(عدد بزرگتر مساوی صفر\\)\\."
+            example = "مثال: `1.5` یا `0`"
+            status_text = f"مقدار فعلی: `{current_value:.2f}` \\({'نامحدود' if current_value <= 0 else f'لات {current_value:.2f}'}\\)\n\n"
+        
+        elif limit_type == "max_trades":
+            current_value = mapping_info.max_concurrent_trades
+            prompt_text = "حداکثر تعداد معاملات باز همزمان \\(Max Concurrent Trades\\) از این سورس را وارد کنید \\(عدد صحیح بزرگتر مساوی صفر\\)\\."
+            example = "مثال: `3` یا `0`"
+            status_text = f"مقدار فعلی: `{current_value}` \\({'نامحدود' if current_value <= 0 else f'{current_value} معامله'}\\)\n\n"
+
+        elif limit_type == "dd_limit":
+            current_value = mapping_info.source_drawdown_limit
+            prompt_text = f"حد ضرر شناور \\(Source Drawdown Limit\\) برای *مجموع معاملات باز* این سورس را به واحد پولی حساب وارد کنید \\(عدد بزرگتر مساوی صفر\\)\\."
+            example = "مثال: `200.0` یا `0`"
+            status_text = f"مقدار فعلی: `{current_value:.2f}` \\({'نامحدود' if current_value <= 0 else f'{current_value:.2f} دلار'}\\)\n\n"
+        
+        else:
+             logger.error(f"Invalid limit_type '{limit_type}' encountered in conn_set_limit_start.", extra=log_extra)
+             await query.edit_message_text("❌ خطای داخلی: نوع محدودیت نامعتبر است\\.")
+             return ConversationHandler.END
+        
+        log_extra['details']['current_value'] = current_value
+        logger.info(f"Fetched current limit value ({limit_type}). Displaying edit prompt.", extra=log_extra)
+
+    except Exception as e:
+        log_extra['error'] = str(e)
+        logger.error(f"Failed to fetch mapping info for limit edit (ID: {mapping_id}, Type: {limit_type}).", exc_info=True, extra=log_extra)
+        await query.edit_message_text(
+            f"❌ خطایی در خواندن اطلاعات اتصال رخ داد: {escape_markdown(str(e), 2)}",
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+        return ConversationHandler.END
+
+
+    final_prompt = (
+        f"⚙️ *تنظیمات محدودیت*\n\n"
+        f"{status_text}"
+        f"{prompt_text}\n"
+        f"عدد `0` به معنی نامحدود است\\.\n"
+        f"{example}"
+    )
 
     await query.edit_message_text(
-        f"{prompt_text}\n{example}",
+        final_prompt,
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 لغو", callback_data=f"conn:cancel_edit:{mapping_id}")]]) ,
         parse_mode=ParseMode.MARKDOWN_V2
     )
-    logger.info(f"Starting edit limit value conversation (MappingID: {mapping_id}, Type: {limit_type})", extra={'user_id': update.effective_user.id, 'entity_id': mapping_id})
-    return CONN_LIMIT_VALUE # ورود به State انتظار مقدار محدودیت
+    
+    logger.info(f"Starting edit limit value conversation (MappingID: {mapping_id}, Type: {limit_type})", extra=log_extra)
+    return CONN_LIMIT_VALUE
+
+
+
 
 async def conn_set_limit_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """دریافت مقدار محدودیت، اعتبارسنجی، ذخیره و پایان گفتگو."""
@@ -1990,6 +2257,7 @@ async def run(queue: asyncio.Queue):
     application.add_handler(CallbackQueryHandler(copy_settings_menu, pattern="^copy:settings:menu:\d+$"))
     application.add_handler(CallbackQueryHandler(copy_delete_confirm, pattern="^copy:delete:confirm:\d+$"))
     application.add_handler(CallbackQueryHandler(copy_delete_execute, pattern="^copy:delete:execute:\d+$"))
+    application.add_handler(CallbackQueryHandler(copy_settings_reset_dd, pattern="^copy:settings:reset_dd:\d+$"))
 
     # Conversation Handlers
     application.add_handler(source_management_conv_handler)

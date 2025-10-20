@@ -1,523 +1,697 @@
-// MQL5/Experts/TradeCopier_Copy.mq5
-//
-// اکسپرت اسلیو (Copy) - معماری جدید مبتنی بر ZMQ
-// وظیفه: دریافت تنظیمات، دریافت آنی سیگنال‌ها، اجرای معاملات و گزارش نتایج.
-
 #property copyright "TradeCopier Professional"
-#property version   "1.0"
+#property version "1.0"
 #property strict
 
-// --- فراخوانی کتابخانه‌ها ---
-#include <Trade/Trade.mqh>           // کتابخانه استاندارد ترید
-#include <Include/ZMQ/zmq.mqh>       // کتابخانه اصلی ZMQ
-#include <Include/Common/json.mqh>  // کتابخانه کمکی ساخت JSON (برای گزارش‌دهی)
+#include <Trade/Trade.mqh>
+#include <Include/ZMQ/zmq.mqh>
+#include <Include/Common/json.mqh>
 
-// --- ورودی‌های اکسپرت ---
-input string InpServerAddress  = "127.0.0.1";  // آدرس IP سرور پایتون
-input int    InpConfigPort   = 5557;         // پورت REQ تنظیمات
-input int    InpPublishPort  = 5556;         // پورت SUB سیگنال
-input int    InpSignalPort   = 5555;         // پورت PUSH گزارش‌دهی
-input string InpCopyIDStr    = "C_A";          // شناسه منحصر به فرد این اسلیو (باید با دیتابیس مطابقت داشته باشد)
-input ulong  InpMagicNumber  = 12345;        // مجیک نامبر برای تمام معاملات کپی شده
+input string InpServerAddress = "127.0.0.1";
+input int InpConfigPort = 5557;
+input int InpPublishPort = 5556;
+input int InpSignalPort = 5555;
+input string InpCopyIDStr = "C_A";
+input ulong InpMagicNumber = 12345;
 
-// --- ساختارهای داده برای نگهداری تنظیمات ---
-// این ساختار، تنظیمات یک اتصال (Mapping) را در حافظه نگه می‌دارد
-struct sSourceConfig
-{
-    string SourceTopicID;       // شناسه مستر برای دنبال کردن (مثال: "S1")
-    string CopyMode;            // "ALL", "GOLD_ONLY", "SYMBOLS"
-    string AllowedSymbols;      // "EURUSD;GBPUSD"
-    string VolumeType;          // "MULTIPLIER", "FIXED"
-    double VolumeValue;         // 1.0
-    double MaxLotSize;          // 0.0 =
-    int    MaxConcurrentTrades; // 0 =
-    double SourceDrawdownLimit; // 0.0 =
+struct sSourceConfig {
+    string SourceTopicID;
+    string CopyMode;
+    string AllowedSymbols;
+    string VolumeType;
+    double VolumeValue;
+    double MaxLotSize;
+    int MaxConcurrentTrades;
+    double SourceDrawdownLimit;
 };
 
-// این ساختار، تنظیمات کلی این اسلیو را نگه می‌دارد
-struct sGlobalConfig
-{
+struct sGlobalConfig {
     double DailyDrawdownPercent;
     double AlertDrawdownPercent;
-    bool   ResetDDFlag;
+    bool ResetDDFlag;
 };
 
-// --- متغیرهای سراسری ---
-CTrade       g_trade;                 // نمونه کلاس ترید
-CJsonBuilder g_json_builder;    // ابزار ساخت پیام JSON (برای گزارش)
+struct PositionMap {
+    ulong ticket;
+    long source_pos_id;
+    string source_id_str;
+};
 
-// کانتکست ZMQ
-int          g_zmq_context;
+struct RetryMessage {
+    string json;
+    int attempts;
+};
 
-// سوکت‌ها
-int          g_zmq_socket_req;    // سوکت REQ (درخواست تنظیمات)
-int          g_zmq_socket_sub;    // سوکت SUB (دریافت سیگنال)
-int          g_zmq_socket_push;   // سوکت PUSH (ارسال گزارش)
+CTrade g_trade;
+CJsonBuilder g_json_builder;
 
-// آرایه‌های نگهداری تنظیمات (دریافتی از سرور)
-sSourceConfig g_source_configs[]; // لیست تمام اتصالات مجاز
-sGlobalConfig g_global_config;    // تنظیمات کلی
+int g_zmq_context;
+int g_zmq_socket_req;
+int g_zmq_socket_sub;
+int g_zmq_socket_push;
 
-//+------------------------------------------------------------------+
-//| Expert initialization function                                   |
-//+------------------------------------------------------------------+
-int OnInit()
-{
-    Print("Initializing Copy EA (ZMQ v1.0)...");
+sSourceConfig g_source_configs[];
+sGlobalConfig g_global_config;
+
+PositionMap g_position_map[];
+RetryMessage g_retry_queue[];
+int g_ping_fails = 0;
+int g_timer_count = 0;
+double g_daily_dd = 0.0;
+datetime g_last_dd_reset = 0;
+datetime g_last_recv_time = 0;
+string g_prev_topics[];
+
+int OnInit() {
+    if (StringLen(InpCopyIDStr) == 0) {
+        LogEvent("ERROR", "Invalid InpCopyIDStr: empty");
+        return(INIT_PARAMETERS_INCORRECT);
+    }
+    if (InpMagicNumber == 0) {
+        LogEvent("ERROR", "Invalid InpMagicNumber: zero");
+        return(INIT_PARAMETERS_INCORRECT);
+    }
+    if (InpConfigPort <= 0 || InpPublishPort <= 0 || InpSignalPort <= 0) {
+        LogEvent("ERROR", "Invalid port numbers");
+        return(INIT_PARAMETERS_INCORRECT);
+    }
+
     g_trade.SetExpertMagicNumber(InpMagicNumber);
     g_trade.SetMarginMode();
-    
-    // --- ۱. راه‌اندازی ZMQ ---
-    g_zmq_context = ZmqContextNew(1);
-    if(g_zmq_context == 0)
-    {
-        Print("Failed to create ZMQ context. Error: ", ZmqErrno());
+
+    g_zmq_context = ZmqContextNew(2);
+    if (g_zmq_context == 0) {
+        LogEvent("ERROR", "Failed to create ZMQ context", ZmqErrno());
         return(INIT_FAILED);
-    }
-    
-    // --- ۲. اتصال به سوکت PUSH (برای ارسال گزارش) ---
-    // (این سوکت ساده است و نیازی به پاسخ ندارد)
-    g_zmq_socket_push = ZmqSocketNew(g_zmq_context, ZMQ_PUSH);
-    string push_address = "tcp://" + InpServerAddress + ":" + (string)InpSignalPort;
-    if(ZmqConnect(g_zmq_socket_push, push_address) != 0)
-    {
-        Print("Failed to connect ZMQ PUSH socket to ", push_address, ". Error: ", ZmqErrno());
-        // (ادامه می‌دهیم، شاید ارتباط بعداً برقرار شود)
-    }
-    else
-    {
-        Print("PUSH socket connected to ", push_address);
     }
 
-    // --- ۳. دریافت تنظیمات از سرور (مهم‌ترین بخش) ---
-    if(!FetchConfiguration())
-    {
-        Print("Failed to fetch configuration from server. Halting initialization.");
+    g_zmq_socket_push = ZmqSocketNew(g_zmq_context, ZMQ_PUSH);
+    string push_address = "tcp://" + InpServerAddress + ":" + (string)InpSignalPort;
+    if (ZmqConnect(g_zmq_socket_push, push_address) != 0) {
+        LogEvent("ERROR", "Failed to connect ZMQ PUSH socket to " + push_address, ZmqErrno());
+    } else {
+        LogEvent("INFO", "PUSH socket connected to " + push_address);
+    }
+    ZmqSocketSet(g_zmq_socket_push, ZMQ_SNDHWM, 100);
+
+    if (!FetchConfiguration()) {
+        LogEvent("ERROR", "Failed to fetch configuration from server");
         CleanupZMQ();
         return(INIT_FAILED);
     }
-    
-    // --- ۴. اتصال به سوکت SUB (برای دریافت سیگنال) ---
+
     g_zmq_socket_sub = ZmqSocketNew(g_zmq_context, ZMQ_SUB);
     string sub_address = "tcp://" + InpServerAddress + ":" + (string)InpPublishPort;
-    if(ZmqConnect(g_zmq_socket_sub, sub_address) != 0)
-    {
-        Print("Failed to connect ZMQ SUB socket to ", sub_address, ". Error: ", ZmqErrno());
+    if (ZmqConnect(g_zmq_socket_sub, sub_address) != 0) {
+        LogEvent("ERROR", "Failed to connect ZMQ SUB socket to " + sub_address, ZmqErrno());
         CleanupZMQ();
         return(INIT_FAILED);
     }
-    
-    // --- ۵. ثبت‌نام (Subscribe) برای تاپیک‌های مجاز ---
-    // (بر اساس تنظیماتی که در مرحله ۳ دریافت کردیم)
-    int mappings_count = ArraySize(g_source_configs);
-    if(mappings_count == 0)
-    {
-        Print("Warning: No active mappings received from server. EA will run but copy nothing.");
-    }
-    
-    for(int i = 0; i < mappings_count; i++)
-    {
-        string topic = g_source_configs[i].SourceTopicID;
-        // ZmqSocketSetString(g_zmq_socket_sub, ZMQ_SUBSCRIBE, topic); // (در برخی نسخه‌های کتابخانه ZMQ، این روش کار نمی‌کند)
-        
-        // روش مطمئن‌تر با ZmqSocketSet:
-        uchar topic_array[];
-        StringToCharArray(topic, topic_array);
-        if(ZmqSocketSet(g_zmq_socket_sub, ZMQ_SUBSCRIBE, topic_array) != 0)
-        {
-             Print("Failed to subscribe to topic '", topic, "'. Error: ", ZmqErrno());
-        }
-        else
-        {
-             Print("Subscribed to topic: '", topic, "'");
-        }
-    }
-    
-    Print("SUB socket connected to ", sub_address);
-    Print("--- Copy EA Initialized Successfully ---");
-    EventSetTimer(1); // تایمر ۱ ثانیه‌ای برای چک کردن سیگنال‌ها
+    ZmqSocketSet(g_zmq_socket_sub, ZMQ_RCVHWM, 100);
+
+    UpdateSubscriptions();
+
+    EventSetMillisecondTimer(100);
+
+    LogEvent("INFO", "--- Copy EA Initialized Successfully ---");
     return(INIT_SUCCEEDED);
 }
 
-//+------------------------------------------------------------------+
-//| تابع کمکی: دریافت تنظیمات از سرور پایتون
-//+------------------------------------------------------------------+
-bool FetchConfiguration()
-{
-    Print("Attempting to fetch configuration for '", InpCopyIDStr, "'...");
-    
-    // ۱. ایجاد سوکت REQ
+bool FetchConfiguration() {
+    LogEvent("INFO", "Attempting to fetch configuration for '" + InpCopyIDStr + "'");
+
     g_zmq_socket_req = ZmqSocketNew(g_zmq_context, ZMQ_REQ);
     string req_address = "tcp://" + InpServerAddress + ":" + (string)InpConfigPort;
-    
-    if(ZmqConnect(g_zmq_socket_req, req_address) != 0)
-    {
-        Print("Failed to connect ZMQ REQ socket to ", req_address, ". Error: ", ZmqErrno());
+
+    if (ZmqConnect(g_zmq_socket_req, req_address) != 0) {
+        LogEvent("ERROR", "Failed to connect ZMQ REQ socket to " + req_address, ZmqErrno());
         return false;
     }
-    
-    // ۲. ساخت پیام درخواست JSON
+
     g_json_builder.Init();
     g_json_builder.Add("command", "GET_CONFIG");
     g_json_builder.Add("copy_id_str", InpCopyIDStr);
-    
-    // ۳. ارسال درخواست
-    if(ZmqSendString(g_zmq_socket_req, g_json_builder.ToString()) == -1)
-    {
-        Print("Failed to send config request. Error: ", ZmqErrno());
+
+    if (ZmqSendString(g_zmq_socket_req, g_json_builder.ToString(), 0) == -1) {
+        LogEvent("ERROR", "Failed to send config request", ZmqErrno());
         ZmqClose(g_zmq_socket_req);
         return false;
     }
-    
-    // ۴. دریافت پاسخ (با انتظار محدود)
-    // (این بخش حیاتی است - باید منتظر پاسخ بمانیم)
-    // (در MQL5، دریافت مسدودکننده (blocking) در OnInit می‌تواند مشکل‌ساز باشد،
-    // اما برای تنظیمات اولیه ضروری است. از یک تایم‌اوت ساده استفاده می‌کنیم)
-    
-    // TODO: پیاده‌سازی تایم‌اوت صحیح با ZMQ_POLL
-    
-    uchar recv_buffer[65536]; // بافر 64KB برای دریافت تنظیمات
-    int recv_len = ZmqRecv(g_zmq_socket_req, recv_buffer, 65536, 0); // 0 = پرچم مسدود کننده
-    ZmqClose(g_zmq_socket_req); // بلافاصله پس از دریافت، سوکت REQ را می‌بندیم
-    
-    if(recv_len <= 0)
-    {
-        Print("Failed to receive config response. Error: ", ZmqErrno());
-        return false;
-    }
-    
-    string json_response = CharArrayToString(recv_buffer, 0, recv_len);
-    
-    // ۵. پارس کردن پاسخ JSON
-    CJAVal json_data;
-    if(!json_data.Deserialize(json_response))
-    {
-        Print("Failed to deserialize JSON response: ", json_response);
-        return false;
-    }
-    
-    if(json_data["status"].ToStr() != "OK")
-    {
-        Print("Server returned an error: ", json_data["message"].ToStr());
-        return false;
-    }
-    
-    // ۶. بارگذاری تنظیمات در متغیرهای سراسری
-    CJAVal config = json_data["config"];
-    
-    // بارگذاری تنظیمات کلی
-    CJAVal global_settings = config["global_settings"];
-    g_global_config.DailyDrawdownPercent = global_settings["daily_drawdown_percent"].ToDouble();
-    g_global_config.AlertDrawdownPercent = global_settings["alert_drawdown_percent"].ToDouble();
-    g_global_config.ResetDDFlag           = global_settings["reset_dd_flag"].ToBool();
-    
-    PrintFormat("Global settings loaded: DD=%.2f%%, Alert=%.2f%%",
-                g_global_config.DailyDrawdownPercent, g_global_config.AlertDrawdownPercent);
 
-    // بارگذاری تنظیمات اتصالات (Mappings)
+    uchar recv_buffer[65536];
+    int recv_len = ZmqRecv(g_zmq_socket_req, recv_buffer, 65536, 0);
+    ZmqClose(g_zmq_socket_req);
+
+    if (recv_len <= 0) {
+        LogEvent("ERROR", "Failed to receive config response", ZmqErrno());
+        return false;
+    }
+
+    string json_response = CharArrayToString(recv_buffer, 0, recv_len);
+
+    CJAVal json_data;
+    if (!json_data.Deserialize(json_response)) {
+        LogEvent("ERROR", "Failed to deserialize JSON response: " + json_response);
+        return false;
+    }
+
+    if (json_data["status"].ToStr() != "OK") {
+        LogEvent("ERROR", "Server returned an error: " + json_data["message"].ToStr());
+        return false;
+    }
+
+    CJAVal config = json_data["config"];
+
+    CJAVal global_settings = config["global_settings"];
+    g_global_config.DailyDrawdownPercent = global_settings["daily_drawdown_percent"].ToDbl();
+    g_global_config.AlertDrawdownPercent = global_settings["alert_drawdown_percent"].ToDbl();
+    g_global_config.ResetDDFlag = global_settings["reset_dd_flag"].ToBool();
+
+    LogEvent("INFO", "Global settings loaded: DD=" + DoubleToString(g_global_config.DailyDrawdownPercent, 2) + "%, Alert=" + DoubleToString(g_global_config.AlertDrawdownPercent, 2) + "%");
+
+    if (g_global_config.ResetDDFlag) {
+        g_daily_dd = 0.0;
+        g_last_dd_reset = TimeCurrent();
+        g_global_config.ResetDDFlag = false;
+        LogEvent("INFO", "DD reset triggered on config fetch");
+    }
+
     CJAVal mappings = config["mappings"];
     int mappings_count = mappings.Size();
     ArrayResize(g_source_configs, mappings_count);
-    
-    for(int i = 0; i < mappings_count; i++)
-    {
+
+    for (int i = 0; i < mappings_count; i++) {
         CJAVal m = mappings[i];
-        g_source_configs[i].SourceTopicID       = m["source_topic_id"].ToStr();
-        g_source_configs[i].CopyMode            = m["copy_mode"].ToStr();
-        g_source_configs[i].AllowedSymbols      = m["allowed_symbols"].ToStr();
-        g_source_configs[i].VolumeType          = m["volume_type"].ToStr();
-        g_source_configs[i].VolumeValue         = m["volume_value"].ToDouble();
-        g_source_configs[i].MaxLotSize          = m["max_lot_size"].ToDouble();
-        g_source_configs[i].MaxConcurrentTrades = (int)m["max_concurrent_trades"].ToInteger();
-        g_source_configs[i].SourceDrawdownLimit = m["source_drawdown_limit"].ToDouble();
-        
-        PrintFormat("Mapping #%d loaded: Source=%s, Vol=%.2f (%s)",
-                    i, g_source_configs[i].SourceTopicID, g_source_configs[i].VolumeValue, g_source_configs[i].VolumeType);
+        g_source_configs[i].SourceTopicID = m["source_topic_id"].ToStr();
+        g_source_configs[i].CopyMode = m["copy_mode"].ToStr();
+        g_source_configs[i].AllowedSymbols = m["allowed_symbols"].ToStr();
+        g_source_configs[i].VolumeType = m["volume_type"].ToStr();
+        g_source_configs[i].VolumeValue = m["volume_value"].ToDbl();
+        g_source_configs[i].MaxLotSize = m["max_lot_size"].ToDbl();
+        g_source_configs[i].MaxConcurrentTrades = (int)m["max_concurrent_trades"].ToInt();
+        g_source_configs[i].SourceDrawdownLimit = m["source_drawdown_limit"].ToDbl();
+
+        LogEvent("INFO", "Mapping #" + IntegerToString(i) + " loaded: Source=" + g_source_configs[i].SourceTopicID + ", Vol=" + DoubleToString(g_source_configs[i].VolumeValue, 2) + " (" + g_source_configs[i].VolumeType + ")");
     }
 
     return true;
 }
 
-//+------------------------------------------------------------------+
-//| Expert deinitialization function                                 |
-//+------------------------------------------------------------------+
-void OnDeinit(const int reason)
-{
-    Print("Deinitializing Copy EA...");
+void OnDeinit(const int reason) {
+    LogEvent("INFO", "Deinitializing Copy EA...");
+
     EventKillTimer();
     CleanupZMQ();
-    Print("Copy EA Deinitialized.");
+
+    LogEvent("INFO", "Copy EA Deinitialized.");
 }
 
-//+------------------------------------------------------------------+
-//| تابع کمکی: بستن تمام سوکت‌های ZMQ
-//+------------------------------------------------------------------+
-void CleanupZMQ()
-{
-    if(g_zmq_socket_req != 0)
+void CleanupZMQ() {
+    if (g_zmq_socket_req != 0)
         ZmqClose(g_zmq_socket_req);
-    if(g_zmq_socket_sub != 0)
+    if (g_zmq_socket_sub != 0)
         ZmqClose(g_zmq_socket_sub);
-    if(g_zmq_socket_push != 0)
+    if (g_zmq_socket_push != 0)
         ZmqClose(g_zmq_socket_push);
-    if(g_zmq_context != 0)
+    if (g_zmq_context != 0)
         ZmqContextTerm(g_zmq_context);
-        
+
     g_zmq_socket_req = 0;
     g_zmq_socket_sub = 0;
     g_zmq_socket_push = 0;
     g_zmq_context = 0;
 }
 
-//+------------------------------------------------------------------+
-//| Timer function                                                   |
-//+------------------------------------------------------------------+
-void OnTimer()
-{
-    // TODO: (در گام‌های بعد)
-    // CheckDailyDrawdown();
-    
-    // چک کردن سوکت سیگنال‌ها برای پیام‌های جدید
+void OnTimer() {
+    if (ArraySize(g_retry_queue) > 0) {
+        RetryMessage msg = g_retry_queue[0];
+        if (ZmqSendString(g_zmq_socket_push, msg.json, ZMQ_DONTWAIT) != -1) {
+            LogEvent("INFO", "Retry report send successful");
+            ArrayCopy(g_retry_queue, g_retry_queue, 0, 1);
+            ArrayResize(g_retry_queue, ArraySize(g_retry_queue) - 1);
+        } else {
+            int err = ZmqErrno();
+            LogEvent("WARN", "Retry report send failed", err);
+            g_retry_queue[0].attempts++;
+            if (g_retry_queue[0].attempts >= 3) {
+                LogEvent("ERROR", "Max retries reached for report, discarding");
+                ArrayCopy(g_retry_queue, g_retry_queue, 0, 1);
+                ArrayResize(g_retry_queue, ArraySize(g_retry_queue) - 1);
+            }
+        }
+    }
+
+    g_timer_count++;
+    if (g_timer_count % 300 == 0) {
+        if (!FetchConfiguration()) {
+            LogEvent("WARN", "Config refresh failed");
+        } else {
+            UpdateSubscriptions();
+            LogEvent("INFO", "Config refreshed successfully");
+        }
+    }
+
+    g_timer_count++;
+    if (g_timer_count % 300 == 0) {
+        g_json_builder.Init();
+        g_json_builder.Add("event", "PING_COPY");
+        g_json_builder.Add("copy_id_str", InpCopyIDStr);
+        g_json_builder.Add("timestamp", (long)TimeCurrent());
+        string ping_msg = g_json_builder.ToString();
+
+        if (ZmqSendString(g_zmq_socket_push, ping_msg, ZMQ_DONTWAIT) == -1) {
+            LogEvent("WARN", "Ping send failed", ZmqErrno());
+            g_ping_fails++;
+            if (g_ping_fails >= 3) {
+                LogEvent("ERROR", "Multiple ping fails, attempting reconnect", g_ping_fails);
+                ReconnectSockets();
+            }
+        } else {
+            g_ping_fails = 0;
+            LogEvent("INFO", "Ping sent successfully");
+        }
+    }
+
+    if (TimeCurrent() - g_last_recv_time < 0.05) return;
+
     CheckSignalSocket();
 }
 
-//+------------------------------------------------------------------+
-//| چک کردن سوکت SUB برای سیگنال‌های جدید
-//+------------------------------------------------------------------+
-void CheckSignalSocket()
-{
-    if(g_zmq_socket_sub == 0) return;
-    
-    uchar recv_buffer[4096]; // بافر 4KB
-    string topic_received;
-    string json_message;
-    
-    // حلقه برای خواندن تمام پیام‌های موجود در صف، به صورت غیر مسدود
-    while(true)
-    {
-        // ۱. خواندن تاپیک (غیر مسدود)
-        int topic_len = ZmqRecv(g_zmq_socket_sub, recv_buffer, 4096, ZMQ_DONTWAIT);
-        if(topic_len <= 0)
-            break; // هیچ پیامی در صف وجود ندارد
-            
-        topic_received = CharArrayToString(recv_buffer, 0, topic_len);
-        
-        // ۲. بررسی اینکه آیا پیام ادامه دارد (RCVMORE)
-        int rcvmore = 0;
-        ZmqSocketGet(g_zmq_socket_sub, ZMQ_RCVMORE, rcvmore);
-        
-        if(!rcvmore)
-        {
-            Print("Warning: Received topic '", topic_received, "' but no message body. Skipping.");
-            continue;
-        }
-        
-        // ۳. خواندن بدنه پیام (غیر مسدود)
-        int msg_len = ZmqRecv(g_zmq_socket_sub, recv_buffer, 4096, ZMQ_DONTWAIT);
-        if(msg_len <= 0)
-        {
-            Print("Warning: Received topic '", topic_received, "' but message body read failed. Error: ", ZmqErrno());
-            continue;
-        }
-        
-        json_message = CharArrayToString(recv_buffer, 0, msg_len);
-        
-        // ۴. پردازش پیام
-        // Print("Received signal on topic '", topic_received, "': ", json_message);
-        ExecuteSignal(topic_received, json_message);
+void ReconnectSockets() {
+    ZmqDisconnect(g_zmq_socket_sub, "tcp://" + InpServerAddress + ":" + (string)InpPublishPort);
+    ZmqDisconnect(g_zmq_socket_push, "tcp://" + InpServerAddress + ":" + (string)InpSignalPort);
+
+    if (ZmqConnect(g_zmq_socket_sub, "tcp://" + InpServerAddress + ":" + (string)InpPublishPort) == 0 &&
+        ZmqConnect(g_zmq_socket_push, "tcp://" + InpServerAddress + ":" + (string)InpSignalPort) == 0) {
+        LogEvent("INFO", "Reconnect successful");
+        g_ping_fails = 0;
+        UpdateSubscriptions();
+    } else {
+        LogEvent("CRITICAL", "Reconnect failed", ZmqErrno());
     }
 }
 
-//+------------------------------------------------------------------+
-//| تابع اصلی منطق کپی: اجرای سیگنال دریافت شده
-//+------------------------------------------------------------------+
-void ExecuteSignal(string source_topic, string json_message)
-{
-    // ۱. پارس کردن JSON سیگنال
+void UpdateSubscriptions() {
+    for (int i = 0; i < ArraySize(g_prev_topics); i++) {
+        uchar topic_array[];
+        StringToCharArray(g_prev_topics[i], topic_array);
+        ZmqSocketSet(g_zmq_socket_sub, ZMQ_UNSUBSCRIBE, topic_array);
+        LogEvent("INFO", "Unsubscribed from old topic: " + g_prev_topics[i]);
+    }
+
+    ArrayResize(g_prev_topics, ArraySize(g_source_configs));
+
+    int mappings_count = ArraySize(g_source_configs);
+    if (mappings_count == 0) {
+        LogEvent("WARN", "No active mappings, nothing to copy");
+    }
+
+    for (int i = 0; i < mappings_count; i++) {
+        string topic = g_source_configs[i].SourceTopicID;
+        uchar topic_array[];
+        StringToCharArray(topic, topic_array);
+        if (ZmqSocketSet(g_zmq_socket_sub, ZMQ_SUBSCRIBE, topic_array) != 0) {
+            LogEvent("ERROR", "Failed to subscribe to topic '" + topic + "'", ZmqErrno());
+        } else {
+            LogEvent("INFO", "Subscribed to topic: '" + topic + "'");
+            g_prev_topics[i] = topic;
+        }
+    }
+}
+
+void CheckSignalSocket() {
+    if (g_zmq_socket_sub == 0) return;
+
+    uchar recv_buffer[4096];
+    string topic_received;
+    string json_message;
+
+    while (true) {
+        int topic_len = ZmqRecv(g_zmq_socket_sub, recv_buffer, 4096, ZMQ_DONTWAIT);
+        if (topic_len <= 0) break;
+
+        topic_received = CharArrayToString(recv_buffer, 0, topic_len);
+
+        int rcvmore = 0;
+        ZmqSocketGet(g_zmq_socket_sub, ZMQ_RCVMORE, rcvmore);
+
+        if (!rcvmore) {
+            LogEvent("WARN", "Received topic '" + topic_received + "' but no message body");
+            continue;
+        }
+
+        int msg_len = ZmqRecv(g_zmq_socket_sub, recv_buffer, 4096, ZMQ_DONTWAIT);
+        if (msg_len <= 0) {
+            LogEvent("WARN", "Message body read failed for topic '" + topic_received + "'", ZmqErrno());
+            continue;
+        }
+
+        json_message = CharArrayToString(recv_buffer, 0, msg_len);
+
+        LogEvent("INFO", "Received signal on topic '" + topic_received + "'");
+        g_last_recv_time = TimeCurrent();
+
+        ProcessSignal(topic_received, json_message);
+    }
+}
+
+void ProcessSignal(string source_topic, string json_message) {
     CJAVal signal;
-    if(!signal.Deserialize(json_message))
-    {
-        Print("Failed to deserialize signal JSON: ", json_message);
+    if (!signal.Deserialize(json_message)) {
+        LogEvent("ERROR", "Failed to deserialize signal JSON: " + json_message);
         return;
     }
-    
-    // ۲. پیدا کردن تنظیمات مربوط به این سورس
+
+    string event_type = signal["event"].ToStr();
+    LogEvent("INFO", "Processing signal event: " + event_type);
+
     sSourceConfig config;
     bool config_found = false;
-    for(int i = 0; i < ArraySize(g_source_configs); i++)
-    {
-        if(g_source_configs[i].SourceTopicID == source_topic)
-        {
+    for (int i = 0; i < ArraySize(g_source_configs); i++) {
+        if (g_source_configs[i].SourceTopicID == source_topic) {
             config = g_source_configs[i];
             config_found = true;
             break;
         }
     }
-    
-    if(!config_found)
-    {
-        Print("Warning: Received signal from unconfigured source '", source_topic, "'. Ignoring.");
+
+    if (!config_found) {
+        LogEvent("WARN", "Signal from unconfigured source '" + source_topic + "'");
         return;
     }
-    
-    // ۳. استخراج اطلاعات سیگنال
-    string event_type     = signal["event"].ToStr();
-    long   source_pos_id  = signal["position_id"].ToInteger();
-    string symbol         = signal["symbol"].ToStr();
-    double volume         = signal["volume"].ToDouble();
-    double price          = signal["price"].ToDouble();
-    double sl             = signal["position_sl"].ToDouble();
-    double tp             = signal["position_tp"].ToDouble();
-    long   position_type  = signal["position_type"].ToInteger(); // 0=BUY, 1=SELL
-    
-    // TODO: (در گام‌های بعد)
-    // - فیلتر کردن نماد (بر اساس config.CopyMode)
-    // - محاسبه حجم نهایی (بر اساس config.VolumeType)
-    // - بررسی محدودیت‌های ریسک (MaxLotSize, MaxConcurrentTrades)
-    
-    double final_volume = volume * config.VolumeValue; // فعلاً فقط ضریب ساده
-    
-    // ساخت کامنت برای شناسایی پوزیشن در آینده
-    string comment = (string)source_pos_id + "|" + source_topic;
-    
-    // ۴. اجرای منطق بر اساس نوع رویداد
-    if(event_type == "TRADE_OPEN")
-    {
-        PrintFormat("EXECUTE OPEN: %s %s %.2f lot (SourceID: %s)",
-                    (position_type == 0 ? "BUY" : "SELL"), symbol, final_volume, source_topic);
-                    
-        bool result = false;
-        if(position_type == 0) // BUY
-        {
-            result = g_trade.Buy(final_volume, symbol, 0, sl, tp, comment);
+
+    long source_pos_id = signal["position_id"].ToInt();
+    string symbol = signal["symbol"].ToStr();
+    double volume = signal["volume"].ToDbl();
+    double price = signal["price"].ToDbl();
+    double sl = signal["position_sl"].ToDbl();
+    double tp = signal["position_tp"].ToDbl();
+    long position_type = signal["position_type"].ToInt();
+
+    if (symbol == "" || volume <= 0) {
+        LogEvent("ERROR", "Invalid signal data: symbol or volume", symbol);
+        return;
+    }
+
+    if (!SymbolSelect(symbol, true)) {
+        LogEvent("ERROR", "Symbol not found: " + symbol);
+        return;
+    }
+
+    if (config.CopyMode == "ALL") {
+    } else if (config.CopyMode == "GOLD_ONLY") {
+        if (StringFind(symbol, "XAU") < 0) {
+            LogEvent("INFO", "Symbol filtered out (GOLD_ONLY): " + symbol);
+            return;
         }
-        else // SELL
-        {
-            result = g_trade.Sell(final_volume, symbol, 0, sl, tp, comment);
-        }
-        
-        if(!result)
-        {
-            Print("Failed to open position. Error: ", g_trade.ResultRetcodeDescription());
-            // TODO: ارسال خطا به سرور
+    } else if (config.CopyMode == "SYMBOLS") {
+        if (StringFind(config.AllowedSymbols, symbol) < 0) {
+            LogEvent("INFO", "Symbol filtered out (SYMBOLS): " + symbol);
+            return;
         }
     }
-    else if(event_type == "TRADE_MODIFY")
-    {
-        // TODO: (در گام‌های بعد)
-        // منطق اصلاح SL/TP پوزیشن باز
+
+    double final_volume;
+    if (config.VolumeType == "MULTIPLIER") {
+        final_volume = volume * config.VolumeValue;
+    } else if (config.VolumeType == "FIXED") {
+        final_volume = config.VolumeValue;
+    } else {
+        LogEvent("ERROR", "Invalid VolumeType: " + config.VolumeType);
+        return;
     }
-    else if(event_type == "TRADE_CLOSE_MASTER")
-    {
-        PrintFormat("EXECUTE CLOSE: %s position %d (SourceID: %s)", symbol, source_pos_id, source_topic);
-        
-        // پیدا کردن پوزیشن مربوطه در این حساب و بستن آن
-        if(PositionSelectByTicket(FindPositionBySourceID(source_pos_id)))
-        {
-            if(!g_trade.PositionClose(PositionGetInteger(POSITION_TICKET)))
-            {
-                Print("Failed to close position. Error: ", g_trade.ResultRetcodeDescription());
-            }
+
+    double vol_step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+    double vol_min = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+    double vol_max = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+    final_volume = NormalizeDouble(final_volume / vol_step, 0) * vol_step;
+    if (final_volume < vol_min) final_volume = vol_min;
+    if (final_volume > vol_max) final_volume = vol_max;
+
+    if (config.MaxLotSize > 0 && final_volume > config.MaxLotSize) {
+        LogEvent("WARN", "Volume exceeds MaxLotSize, capping", final_volume);
+        final_volume = config.MaxLotSize;
+    }
+
+    int concurrent = 0;
+    for (int i = 0; i < ArraySize(g_position_map); i++) {
+        if (g_position_map[i].source_id_str == source_topic) concurrent++;
+    }
+    if (config.MaxConcurrentTrades > 0 && concurrent >= config.MaxConcurrentTrades) {
+        LogEvent("WARN", "Max concurrent trades reached for source " + source_topic, concurrent);
+        return;
+    }
+
+    if (config.SourceDrawdownLimit > 0) {
+        LogEvent("WARN", "SourceDrawdownLimit not implemented yet");
+    }
+
+    CheckDailyDrawdown();
+
+    double point_value = SymbolInfoDouble(symbol, SYMBOL_POINT) * SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+    double projected_profit = final_volume * point_value * (position_type == 0 ? (tp - price) : (price - tp));
+    if (g_daily_dd + projected_profit < -AccountEquity() * (g_global_config.DailyDrawdownPercent / 100.0)) {
+        LogEvent("WARN", "Trade rejected: exceeds daily DD limit", g_daily_dd + projected_profit);
+        return;
+    }
+
+    string short_pos_id = IntegerToString((int)(source_pos_id % 100000000));
+    string comment = short_pos_id + "|" + source_topic;
+    if (StringLen(comment) > 31) comment = StringSubstr(comment, 0, 31);
+
+    if (event_type == "TRADE_OPEN") {
+        LogEvent("INFO", "Executing OPEN: " + (position_type == 0 ? "BUY" : "SELL") + " " + symbol + " " + DoubleToString(final_volume, 2) + " lots from source " + source_topic);
+
+        MqlTradeRequest req;
+        ZeroMemory(req);
+        req.action = TRADE_ACTION_DEAL;
+        req.symbol = symbol;
+        req.volume = final_volume;
+        req.type = (position_type == 0 ? ORDER_TYPE_BUY : ORDER_TYPE_SELL);
+        req.deviation = 10;
+        req.sl = sl;
+        req.tp = tp;
+        req.comment = comment;
+
+        MqlTradeResult res;
+        if (!g_trade.OrderSend(req, res)) {
+            LogEvent("ERROR", "Open trade failed", res.retcode);
+            SendErrorReport("Open failed: " + symbol);
+            return;
+        } else {
+            LogEvent("INFO", "Open trade successful, ticket=" + IntegerToString((int)res.deal));
+            int size = ArraySize(g_position_map);
+            ArrayResize(g_position_map, size + 1);
+            g_position_map[size].ticket = res.deal;
+            g_position_map[size].source_pos_id = source_pos_id;
+            g_position_map[size].source_id_str = source_topic;
         }
-        else
-        {
-            Print("Position ", source_pos_id, " not found for closing.");
+    } else if (event_type == "TRADE_MODIFY") {
+        LogEvent("INFO", "Executing MODIFY for position " + IntegerToString(source_pos_id) + " from source " + source_topic);
+
+        ulong ticket = FindPositionBySourceID(source_pos_id);
+        if (ticket == 0) {
+            LogEvent("WARN", "Position not found for modify: " + IntegerToString(source_pos_id));
+            return;
         }
+
+        MqlTradeRequest req;
+        ZeroMemory(req);
+        req.action = TRADE_ACTION_SLTP;
+        req.position = ticket;
+        req.sl = sl;
+        req.tp = tp;
+
+        MqlTradeResult res;
+        if (!g_trade.RequestExecute(req, res)) {
+            LogEvent("ERROR", "Modify trade failed", res.retcode);
+            SendErrorReport("Modify failed: " + symbol);
+        } else {
+            LogEvent("INFO", "Modify successful for ticket " + IntegerToString((int)ticket));
+        }
+    } else if (event_type == "TRADE_CLOSE_MASTER") {
+        LogEvent("INFO", "Executing CLOSE for position " + IntegerToString(source_pos_id) + " from source " + source_topic);
+
+        ulong ticket = FindPositionBySourceID(source_pos_id);
+        if (ticket == 0) {
+            LogEvent("WARN", "Position not found for close: " + IntegerToString(source_pos_id));
+            return;
+        }
+
+        if (!g_trade.PositionClose(ticket)) {
+            LogEvent("ERROR", "Close trade failed", g_trade.ResultRetcode());
+            SendErrorReport("Close failed: " + symbol);
+        } else {
+            LogEvent("INFO", "Close successful for ticket " + IntegerToString((int)ticket));
+            RemoveFromMap(ticket);
+        }
+    } else if (event_type == "TRADE_PARTIAL_CLOSE_MASTER") {
+        double volume_closed = signal["volume_closed"].ToDbl();
+        LogEvent("INFO", "Executing PARTIAL CLOSE for position " + IntegerToString(source_pos_id) + " volume " + DoubleToString(volume_closed, 2) + " from source " + source_topic);
+
+        ulong ticket = FindPositionBySourceID(source_pos_id);
+        if (ticket == 0) {
+            LogEvent("WARN", "Position not found for partial close: " + IntegerToString(source_pos_id));
+            return;
+        }
+
+        if (!g_trade.PositionClosePartial(ticket, volume_closed)) {
+            LogEvent("ERROR", "Partial close failed", g_trade.ResultRetcode());
+            SendErrorReport("Partial close failed: " + symbol);
+        } else {
+            LogEvent("INFO", "Partial close successful for ticket " + IntegerToString((int)ticket));
+        }
+    } else {
+        LogEvent("WARN", "Unknown event type: " + event_type);
     }
 }
 
-//+------------------------------------------------------------------+
-//| پیدا کردن تیکت پوزیشن بر اساس شناسه سورس (از کامنت)
-//+------------------------------------------------------------------+
-ulong FindPositionBySourceID(long source_pos_id)
-{
-    string source_id_str = (string)source_pos_id;
-    
-    for(int i = PositionsTotal() - 1; i >= 0; i--)
-    {
+void CheckDailyDrawdown() {
+    if (TimeCurrent() - g_last_dd_reset >= 86400) {
+        g_daily_dd = 0.0;
+        g_last_dd_reset = TimeCurrent();
+        LogEvent("INFO", "Daily DD reset on new day");
+    }
+}
+
+ulong FindPositionBySourceID(long source_pos_id) {
+    for (int i = 0; i < ArraySize(g_position_map); i++) {
+        if (g_position_map[i].source_pos_id == source_pos_id) {
+            return g_position_map[i].ticket;
+        }
+    }
+
+    string short_search_id = IntegerToString((int)(source_pos_id % 100000000));
+
+    for (int i = PositionsTotal() - 1; i >= 0; i--) {
         ulong ticket = PositionGetTicket(i);
-        if(!PositionSelectByTicket(ticket)) continue;
-        
-        if(PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
-        {
+        if (!PositionSelectByTicket(ticket)) continue;
+
+        if (PositionGetInteger(POSITION_MAGIC) == InpMagicNumber) {
             string comment = PositionGetString(POSITION_COMMENT);
             string parts[];
-            if(StringSplit(comment, '|', parts) > 0)
-            {
-                if(parts[0] == source_id_str)
-                {
-                    return ticket; // پوزیشن پیدا شد
+            if (StringSplit(comment, '|', parts) > 0) {
+                if (parts[0] == short_search_id) {
+                    LogEvent("WARN", "Found position via comment fallback, adding to map", ticket);
+                    int size = ArraySize(g_position_map);
+                    ArrayResize(g_position_map, size + 1);
+                    g_position_map[size].ticket = ticket;
+                    g_position_map[size].source_pos_id = source_pos_id;
+                    g_position_map[size].source_id_str = parts[1];
+                    return ticket;
                 }
             }
         }
     }
-    return 0; // پیدا نشد
+    return 0;
 }
 
-//+------------------------------------------------------------------+
-//| Trade Transaction event handler (برای گزارش‌دهی)
-//+------------------------------------------------------------------+
-void OnTradeTransaction(const MqlTradeTransaction &trans,
-                        const MqlTradeRequest &request,
-                        const MqlTradeResult &result)
-{
-    // ما فقط به تراکنش‌هایی که یک معامله بستن (OUT) اضافه می‌کنند، علاقه‌مندیم
-    if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
-        return;
-        
-    if((ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY) != DEAL_ENTRY_OUT)
-        return;
-        
-    // فیلتر کردن بر اساس مجیک نامبر خودمان
-    if(trans.magic != InpMagicNumber)
-        return;
-        
-    // ارسال گزارش این معامله بسته شده به سرور پایتون
+void RemoveFromMap(ulong ticket) {
+    for (int i = 0; i < ArraySize(g_position_map); i++) {
+        if (g_position_map[i].ticket == ticket) {
+            ArrayCopy(g_position_map, g_position_map, i, i + 1);
+            ArrayResize(g_position_map, ArraySize(g_position_map) - 1);
+            LogEvent("INFO", "Removed position from map", ticket);
+            return;
+        }
+    }
+}
+
+void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result) {
+    if (trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
+
+    if ((ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY) != DEAL_ENTRY_OUT) return;
+
+    if (trans.magic != InpMagicNumber) return;
+
+    LogEvent("INFO", "Detected close deal, sending report", trans.deal);
+
     SendCloseReport(trans.deal);
 }
 
-//+------------------------------------------------------------------+
-//| ارسال گزارش بسته شدن معامله به سرور (برای دیتابیس و تلگرام)
-//+------------------------------------------------------------------+
-void SendCloseReport(ulong deal_ticket)
-{
-    if(g_zmq_socket_push == 0) return; // اگر سوکت PUSH فعال نیست، ارسال نکن
-    
-    if(!HistoryDealSelect(deal_ticket)) return;
-    
-    // استخراج شناسه سورس از کامنت
+void SendCloseReport(ulong deal_ticket) {
+    if (g_zmq_socket_push == 0) return;
+
+    if (!HistoryDealSelect(deal_ticket)) {
+        LogEvent("ERROR", "Failed to select deal for report", deal_ticket);
+        return;
+    }
+
     string comment = HistoryDealGetString(deal_ticket, DEAL_COMMENT);
     string parts[];
     string source_id_str = "UNKNOWN";
     long source_ticket = 0;
-    
-    if(StringSplit(comment, '|', parts) >= 2)
-    {
-        source_ticket = (long)StringToInt(parts[0]);
+
+    if (StringSplit(comment, '|', parts) >= 2) {
+        source_ticket = (long)StringToInteger(parts[0]);
         source_id_str = parts[1];
     }
 
-    // ساخت پیام JSON
     g_json_builder.Init();
-    g_json_builder.Add("event",         "TRADE_CLOSED_COPY");
-    g_json_builder.Add("copy_id_str",   InpCopyIDStr);
+    g_json_builder.Add("event", "TRADE_CLOSED_COPY");
+    g_json_builder.Add("copy_id_str", InpCopyIDStr);
     g_json_builder.Add("source_id_str", source_id_str);
     g_json_builder.Add("source_ticket", source_ticket);
-    g_json_builder.Add("symbol",        HistoryDealGetString(deal_ticket, DEAL_SYMBOL));
-    g_json_builder.Add("profit",        HistoryDealGetDouble(deal_ticket, DEAL_PROFIT));
-    g_json_builder.Add("volume",        HistoryDealGetDouble(deal_ticket, DEAL_VOLUME));
-    g_json_builder.Add("deal_ticket",   (long)deal_ticket);
-    
+    g_json_builder.Add("symbol", HistoryDealGetString(deal_ticket, DEAL_SYMBOL));
+    g_json_builder.Add("profit", HistoryDealGetDouble(deal_ticket, DEAL_PROFIT));
+    g_json_builder.Add("volume", HistoryDealGetDouble(deal_ticket, DEAL_VOLUME));
+    g_json_builder.Add("deal_ticket", (long)deal_ticket);
+
     string json_message = g_json_builder.ToString();
 
-    // ارسال پیام (بدون انتظار)
-    if(ZmqSendString(g_zmq_socket_push, json_message, ZMQ_DONTWAIT) == -1)
-    {
-        Print("Failed to send close report. Error: ", ZmqErrno());
-    }
-    else
-    {
-        Print("Close report sent: ", json_message);
+    if (ZmqSendString(g_zmq_socket_push, json_message, ZMQ_DONTWAIT) == -1) {
+        LogEvent("ERROR", "Failed to send close report", ZmqErrno());
+        int size = ArraySize(g_retry_queue);
+        ArrayResize(g_retry_queue, size + 1);
+        g_retry_queue[size].json = json_message;
+        g_retry_queue[size].attempts = 0;
+    } else {
+        LogEvent("INFO", "Close report sent successfully");
     }
 }
-//+------------------------------------------------------------------+
+
+void SendErrorReport(string error_msg) {
+    g_json_builder.Init();
+    g_json_builder.Add("event", "EA_ERROR");
+    g_json_builder.Add("copy_id_str", InpCopyIDStr);
+    g_json_builder.Add("message", error_msg);
+
+    string json_message = g_json_builder.ToString();
+
+    if (ZmqSendString(g_zmq_socket_push, json_message, ZMQ_DONTWAIT) == -1) {
+        LogEvent("ERROR", "Failed to send error report", ZmqErrno());
+    } else {
+        LogEvent("INFO", "Error report sent: " + error_msg);
+    }
+}
+
+void LogEvent(string level, string msg, variant extra = -1) {
+    datetime ts = TimeCurrent();
+    string log_str = TimeToString(ts, TIME_DATE|TIME_MINUTES|TIME_SECONDS) + " [" + level + "] [CopyEA]: " + msg;
+    if (extra != -1) {
+        log_str += " {" + VariantToString(extra) + "}";
+    }
+    Print(log_str);
+
+    if (level == "ERROR" || level == "CRITICAL") {
+        int file = FileOpen("CopyEA.log", FILE_WRITE|FILE_ANSI|FILE_TXT|FILE_SHARE_READ);
+        if (file != INVALID_HANDLE) {
+            FileSeek(file, 0, SEEK_END);
+            FileWrite(file, log_str);
+            FileClose(file);
+        }
+        if (level == "CRITICAL") {
+            ExpertRemove();
+        }
+    }
+}
+
+string VariantToString(variant v) {
+    if (typename(v) == "long" || typename(v) == "int") {
+        return "extra:" + IntegerToString((int)v);
+    } else if (typename(v) == "double") {
+        return "extra:" + DoubleToString((double)v, 2);
+    } else if (typename(v) == "string") {
+        return "extra:" + (string)v;
+    }
+    return "";
+}

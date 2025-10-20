@@ -1,0 +1,8 @@
+# CoreService/requirements.txt
+#
+# لیست تمام کتابخانه‌های پایتون مورد نیاز برای اجرای سرویس هسته
+
+sqlalchemy       # برای مدیریت پایگاه داده (ORM)
+pyzmq            # برای ارتباطات لحظه‌ای (Real-time) با MQL5
+python-dotenv    # برای خواندن فایل .env
+python-telegram-bot # (در گام‌های بعدی اضافه خواهد شد)

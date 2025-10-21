@@ -1903,9 +1903,11 @@ async def conn_set_limit_receive(update: Update, context: ContextTypes.DEFAULT_T
 
 # --- آمار معاملات ---
 
+# /******************************************************************
+# #   نمایش منوی انتخاب بازه زمانی برای آمار معاملات
+#  ******************************************************************/
 @admin_only
 async def stats_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """نمایش منوی انتخاب بازه زمانی برای آمار."""
     query = update.callback_query
     await query.answer()
 
@@ -1913,7 +1915,8 @@ async def stats_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📊 آمار کل زمان", callback_data="stats:show:all")],
         [InlineKeyboardButton("📊 آمار امروز", callback_data="stats:show:today")],
         [InlineKeyboardButton("📊 آمار ۷ روز اخیر", callback_data="stats:show:7d")],
-        # [InlineKeyboardButton("📊 آمار ۳۰ روز اخیر", callback_data="stats:show:30d")], # (فعلا غیرفعال)
+        # [جدید] دکمه ۳۰ روزه فعال شد
+        [InlineKeyboardButton("📊 آمار ۳۰ روز اخیر", callback_data="stats:show:30d")], 
         [InlineKeyboardButton("🔙 بازگشت به منوی اصلی", callback_data="main_menu")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1926,34 +1929,43 @@ async def stats_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if "Message is not modified" not in str(e):
              logger.warning(f"Failed to edit message for stats menu: {e}")
 
+
+
+
+# /******************************************************************
+#  * محاسبه و نمایش گزارش آمار معاملات (غیرمسدود)
+#  * این تابع گزارش آمار را با فراخوانی تابع دیتابیس در یک ترد جداگانه
+#  * (asyncio.to_thread) تهیه می‌کند تا ربات مسدود نشود.
+#  ******************************************************************/
 @admin_only
 async def stats_show_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """محاسبه و نمایش گزارش آمار معاملات بر اساس فیلتر زمانی."""
     query = update.callback_query
     await query.answer("در حال محاسبه آمار...")
     user_id = update.effective_user.id
-    time_filter = "all" # پیش‌فرض
+    time_filter = "all"
     try:
         time_filter = query.data.split(':')[-1]
     except IndexError:
-        pass # Use default 'all'
+        pass 
 
     log_extra = {'user_id': user_id, 'callback_data': query.data, 'details': {'time_filter': time_filter}}
 
-    # ویرایش پیام برای نمایش انتظار
     try:
         await query.edit_message_text("⏳ در حال محاسبه آمار برای بازه انتخابی\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
-    except BadRequest: # Ignore if message not modified
+    except BadRequest: 
         pass
 
     title = "📊 آمار کل معاملات"
     if time_filter == "today": title = "📊 آمار معاملات امروز"
     elif time_filter == "7d": title = "📊 آمار معاملات ۷ روز اخیر"
-    # elif time_filter == "30d": title = "📊 آمار معاملات ۳۰ روز اخیر"
+
+    elif time_filter == "30d": title = "📊 آمار معاملات ۳۰ روز اخیر" 
 
     try:
-        # فراخوانی تابع جدید دیتابیس (که بعداً پیاده‌سازی می‌شود)
-        summary_results = database.get_statistics_summary(time_filter=time_filter) # تابع فرضی
+        summary_results = await asyncio.to_thread(
+            database.get_statistics_summary,
+            time_filter=time_filter
+        )
 
         if not summary_results:
             await query.edit_message_text(
@@ -1963,7 +1975,6 @@ async def stats_show_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # --- فرمت‌بندی پیام خروجی (مشابه V1) ---
         message_lines = [f"*{escape_markdown(title, 2)}*"]
         grand_total_profit = sum(item['total_profit'] for item in summary_results)
         grand_total_trades = sum(item['trade_count'] for item in summary_results)
@@ -1972,7 +1983,6 @@ async def stats_show_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message_lines.append(f"> *تعداد معاملات:* `{escape_markdown(str(grand_total_trades), 2)}`")
         message_lines.append("> \\n> ─── *جزئیات بر اساس حساب کپی* ───\\n>")
 
-        # گروه‌بندی نتایج بر اساس copy_id (چون query دیتابیس ممکن است به این شکل برنگرداند)
         stats_by_copy = {}
         for item in summary_results:
              copy_id = item['copy_account_id']
@@ -2002,10 +2012,9 @@ async def stats_show_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     profit_str = escape_markdown(f"{source_stat['profit']:,.2f}", 2)
                     trades_str = escape_markdown(str(source_stat['trades']), 2)
                     message_lines.append(f">       └── *{source_name}:* سود/زیان: `{profit_str}`, تعداد: `{trades_str}`")
-            message_lines.append(">") # خط خالی
+            message_lines.append(">") 
 
         final_message = "\n".join(message_lines)
-        # --- پایان فرمت‌بندی ---
 
         keyboard = [
              [InlineKeyboardButton("🔄 به‌روزرسانی", callback_data=f"stats:show:{time_filter}")],
@@ -2031,7 +2040,6 @@ async def stats_show_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   )
              elif "Message is not modified" not in str(e):
                   raise
-             # else: پیام تغییری نکرده، رد شو
 
     except Exception as e:
         logger.error("Unexpected error in stats_show_report.", exc_info=True, extra=log_extra)
@@ -2048,45 +2056,78 @@ async def stats_show_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 
-
-
-
-
+# /******************************************************************
+#  * نمایش وضعیت کلی سیستم (غیرمسدود)
+#  * این تابع گزارش وضعیت را با فراخوانی تابع دیتابیس در یک ترد جداگانه
+#  * (asyncio.to_thread) تهیه می‌کند تا ربات مسدود نشود.
+#  ******************************************************************/
 @admin_only
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """نمایش وضعیت کلی سیستم."""
     query = update.callback_query
+    log_extra = {'user_id': update.effective_user.id, 'action': 'status_command'}
+    
     if query:
         await query.answer("در حال دریافت گزارش وضعیت...")
+    
     try:
-        report_data = database.get_full_status_report()
+        # [بهبود عملکرد] فراخوانی مسدودکننده دیتابیس به ترد جداگانه منتقل شد
+        report_data = await asyncio.to_thread(database.get_full_status_report)
+        
         if not report_data:
             await query.edit_message_text("هیچ حساب کپی فعالی در سیستم تعریف نشده است.")
             return
+
         message = "📊 *گزارش وضعیت سیستم*\n\n"
         for copy_acc in report_data:
-            message += f"🛡️ *حساب: {copy_acc['name']}* (`{copy_acc['copy_id_str']}`)\n"
+            name_escaped = escape_markdown(copy_acc['name'], 2)
+            id_escaped = escape_markdown(copy_acc['copy_id_str'], 2)
+            
+            message += f"🛡️ *حساب: {name_escaped}* (`{id_escaped}`)\n"
+            
             if copy_acc.get('settings'):
-                message += f"  ▫️ ریسک روزانه: `{copy_acc['settings']['daily_drawdown_percent']}`٪\n"
+                dd_percent = copy_acc['settings'].get('daily_drawdown_percent', 0.0)
+                message += f"  ▫️ ریسک روزانه: `{dd_percent:.2f}`٪\n"
+            
             mappings = copy_acc.get('mappings', [])
             if not mappings:
                 message += "  ▫️ *اتصالات: ۰*\n"
             else:
                 message += f"  ▫️ *اتصالات: {len(mappings)}*\n"
                 for m in mappings:
-                    status = "✅" if m['is_enabled'] else "🛑"
-                    message += f"    {status} ⟵ *{m['source_name']}* (`{m['source_id_str']}`)\n"
-                    message += f"        (حجم: {m['volume_type']} {m['volume_value']})\n"
+                    status = "✅" if m.get('is_enabled', False) else "🛑"
+                    source_name = escape_markdown(m.get('source_name', '؟؟'), 2)
+                    source_id = escape_markdown(m.get('source_id_str', '؟؟'), 2)
+                    vol_type = escape_markdown(m.get('volume_type', 'N/A'), 2)
+                    vol_val = m.get('volume_value', 0.0)
+                    
+                    message += f"    {status} ⟵ *{source_name}* (`{source_id}`)\n"
+                    message += f"        \\(حجم: {vol_type} `{vol_val:.2f}`\\)\n"
             message += "\n"
+
         keyboard = [
             [InlineKeyboardButton("🔄 به‌روزرسانی", callback_data="status:main")],
             [InlineKeyboardButton("🔙 بازگشت به منو", callback_data="main_menu")]
         ]
-        await query.edit_message_text(message, parse_mode=ParseMode.MARKDOWN, reply_markup=InlineKeyboardMarkup(keyboard))
-    except Exception as e:
-        logger.error(f"خطا در دریافت گزارش وضعیت: {e}", exc_info=True)
-        await query.edit_message_text(f"❌ خطایی در هنگام دریافت گزارش رخ داد:\n`{e}`", parse_mode=ParseMode.MARKDOWN)
+        
+        await query.edit_message_text(
+            message, 
+            parse_mode=ParseMode.MARKDOWN_V2, 
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        logger.info("Status report displayed successfully.", extra=log_extra)
 
+    except Exception as e:
+        logger.error(f"خطا در دریافت گزارش وضعیت: {e}", exc_info=True, extra=log_extra)
+        await query.edit_message_text(
+            f"❌ خطایی در هنگام دریافت گزارش رخ داد:\n`{escape_markdown(str(e), 2)}`", 
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+
+
+
+
+
+        
 async def alert_sender_task(bot: Application):
     """ارسال هشدارهای دریافتی از صف ZMQ به ادمین."""
     logger.info("تسک ارسال‌کننده هشدار راه‌اندازی شد.")
@@ -2275,6 +2316,9 @@ async def run(queue: asyncio.Queue):
     # --- هندلرهای آمار ---
     application.add_handler(CallbackQueryHandler(stats_main_menu, pattern="^stats:main$"))
     application.add_handler(CallbackQueryHandler(stats_show_report, pattern="^stats:show:(all|today|7d|30d)$")) # pattern برای فیلترها
+
+
+    
     # --- ConversationHandler برای ویرایش حجم اتصال ---
     edit_conn_volume_conv_handler = ConversationHandler(
         entry_points=[

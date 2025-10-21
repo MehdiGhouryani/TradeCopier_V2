@@ -2,13 +2,20 @@
 #property version "1.0"
 #property strict
 
+
+
 #include <Include/ZMQ/zmq.mqh>
 #include <Include/Common/json.mqh>
+
+
+
 
 input string InpServerAddress = "127.0.0.1";
 input int InpSignalPort = 5555;
 input string InpSourceIDStr = "S1";
 input ulong InpMagicNumber = 0;
+input bool InpEnableDebugLogging = false;
+
 
 int g_zmq_context;
 int g_zmq_socket_push;
@@ -22,8 +29,20 @@ struct RetryMessage {
 RetryMessage g_retry_queue[];
 int g_ping_fails = 0;
 int g_timer_count = 0;
+int g_log_file_handle = INVALID_HANDLE;
 
+
+
+
+// مقداردهی اولیه اکسپرت، بررسی ورودی‌ها و اتصال به سرور ZMQ
 int OnInit() {
+    string log_file_name = "SourceEA_" + InpSourceIDStr + ".log";
+    g_log_file_handle = FileOpen(log_file_name, FILE_WRITE|FILE_ANSI|FILE_TXT|FILE_SHARE_READ);
+    if(g_log_file_handle == INVALID_HANDLE)
+       {
+        Print("CRITICAL: Could not open log file: " + log_file_name);
+       }
+
     if (StringLen(InpSourceIDStr) == 0) {
         LogEvent("ERROR", "Invalid InpSourceIDStr: empty");
         return(INIT_PARAMETERS_INCORRECT);
@@ -63,18 +82,28 @@ int OnInit() {
     return(INIT_SUCCEEDED);
 }
 
+
+
+
+// پاکسازی منابع هنگام خروج اکسپرت
 void OnDeinit(const int reason) {
     LogEvent("INFO", "Deinitializing Source EA...");
 
     EventKillTimer();
-
     if (g_zmq_socket_push != 0)
         ZmqClose(g_zmq_socket_push);
     if (g_zmq_context != 0)
         ZmqContextTerm(g_zmq_context);
 
+    if(g_log_file_handle != INVALID_HANDLE)
+       {
+        FileClose(g_log_file_handle);
+       }
+
     LogEvent("INFO", "Source EA Deinitialized.");
 }
+
+
 
 void OnTimer() {
     if (ArraySize(g_retry_queue) > 0) {
@@ -200,23 +229,31 @@ void SendTradeEvent(ulong deal_ticket, string event_type) {
     }
 }
 
+
+
+// لاگ‌نویسی هوشمند رویدادها با قابلیت فیلتر کردن سطح لاگ
 void LogEvent(string level, string msg, long extra = -1) {
+    if (level == "INFO" && !InpEnableDebugLogging) {
+        return;
+    }
+
     datetime ts = TimeCurrent();
-    string log_str = TimeToString(ts, TIME_DATE|TIME_MINUTES|TIME_SECONDS) + " [" + level + "] [SourceEA]: " + msg;
+    string log_str = TimeToString(ts, TIME_DATE|TIME_MINUTES|TIME_SECONDS) + " [" + level + "] [SourceEA-" + InpSourceIDStr + "]: " + msg;
+
     if (extra != -1) {
         log_str += " {extra:" + IntegerToString((int)extra) + "}";
     }
-    Print(log_str);
 
-    if (level == "ERROR" || level == "CRITICAL") {
-        int file = FileOpen("SourceEA.log", FILE_WRITE|FILE_ANSI|FILE_TXT|FILE_SHARE_READ);
-        if (file != INVALID_HANDLE) {
-            FileSeek(file, 0, SEEK_END);
-            FileWrite(file, log_str);
-            FileClose(file);
-        }
-        if (level == "CRITICAL") {
-            ExpertRemove();
-        }
+    if (level == "WARN" || level == "ERROR" || level == "CRITICAL") {
+        Print(log_str);
+    }
+
+    if(g_log_file_handle != INVALID_HANDLE) {
+        FileSeek(g_log_file_handle, 0, SEEK_END);
+        FileWrite(g_log_file_handle, log_str + "\r\n");
+    }
+
+    if (level == "CRITICAL") {
+        ExpertRemove();
     }
 }

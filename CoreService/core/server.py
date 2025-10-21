@@ -22,29 +22,59 @@ class ZMQServer:
         telegram_alert_queue = alert_queue
         logger.info("سرور ZMQ با صف هشدار تلگرام مقداردهی شد.")
 
+
+
     async def start_config_responder(self):
-        """پاسخگویی به درخواست‌های تنظیمات اکسپرت‌های اسلیو."""
+        """
+        پاسخگویی غیرمسدود (non-blocking) به درخواست‌های تنظیمات (Config)
+        این تابع به درخواست‌های ZMQ.REP گوش می‌دهد و با فراخوانی
+        تابع دیتابیس در یک ترد جداگانه، تنظیمات را برای اکسپرت کپی ارسال می‌کند.
+        """
         socket = self.context.socket(zmq.REP)
         socket.bind(f"tcp://*:{CONFIG_PORT}")
         logger.info(f"Config Responder (REP) listening on port {CONFIG_PORT}...")
+        
         while True:
+            log_extra = {}
+            request_data = {}
             try:
                 request_raw = await socket.recv_string()
                 request_data = json.loads(request_raw)
-                logger.info(f"Config request received: {request_data}")
+                copy_id_str = request_data.get("copy_id_str")
+
+                log_extra = {
+                    "component": "ConfigResponder",
+                    "command": request_data.get("command"),
+                    "copy_id": copy_id_str
+                }
+                
+                logger.info(f"Config request received.", extra=log_extra)
+
                 if request_data.get("command") == "GET_CONFIG":
-                    copy_id_str = request_data.get("copy_id_str")
                     if not copy_id_str:
                         raise ValueError("copy_id_str is missing")
-                    config_data = database.get_config_for_copy_ea(copy_id_str)
+                    
+                    # [بهبود عملکرد] فراخوانی مسدودکننده دیتابیس به یک ترد جداگانه منتقل شد
+                    config_data = await asyncio.to_thread(
+                        database.get_config_for_copy_ea, 
+                        copy_id_str
+                    )
+                    
                     response = {"status": "OK", "config": config_data}
-                    logger.info(f"Sending config for {copy_id_str}...")
+                    logger.info(f"Sending config for {copy_id_str} (non-blocking).", extra=log_extra)
                 else:
                     raise ValueError("Unknown command")
+            
             except Exception as e:
-                logger.error(f"Config request failed: {e}")
+                log_extra["error"] = str(e)
+                log_extra["raw_request"] = request_data # ثبت درخواست کامل در صورت خطا
+                logger.error(f"Config request failed: {e}", extra=log_extra)
                 response = {"status": "ERROR", "message": str(e)}
+            
             await socket.send_json(response)
+
+
+
 
     async def start_signal_collector(self):
         """جمع‌آوری سیگنال‌ها و گزارش‌ها از اکسپرت‌ها."""
@@ -63,36 +93,37 @@ class ZMQServer:
 
 
     async def start_signal_processor(self):
-        """پردازش سیگنال‌های دریافتی، انتشار لازم، ارسال هشدار تلگرام و مدیریت PING."""
+        """
+        پردازشگر اصلی سیگنال‌ها از صف داخلی.
+        این تابع سیگنال‌ها را از صف برداشته، نوع آن‌ها را تشخیص داده،
+        در صورت نیاز به صف انتشار (publish_queue) یا صف تلگرام (telegram_alert_queue) ارسال کرده
+        و گزارش‌های دریافتی را به صورت غیرمسدود (non-blocking) در دیتابیس ذخیره می‌کند.
+        """
         logger.info("Signal Processor task started. Waiting for signals...")
 
         while True:
             signal_data = None
-            log_extra = {} # جزئیات اضافی برای لاگ‌نویسی هوشمند
+            log_extra = {} 
 
             try:
                 signal_data = await self.processing_queue.get()
                 event_type = signal_data.get("event", "UNKNOWN_EVENT")
 
-                # --- استخراج جزئیات اولیه برای لاگ‌نویسی ---
                 log_extra = {
                     "event_type": event_type,
                     "source_id": signal_data.get("source_id_str"),
                     "copy_id": signal_data.get("copy_id_str"),
                     "position_id": signal_data.get("position_id"),
                     "symbol": signal_data.get("symbol"),
-                    "ea_id": signal_data.get("ea_id", signal_data.get("source_id_str", signal_data.get("copy_id_str", "EA"))), # تشخیص هویت EA
+                    "ea_id": signal_data.get("ea_id", signal_data.get("source_id_str", signal_data.get("copy_id_str", "EA"))),
                 }
 
-                logger.debug(f"Received signal from queue.", extra=log_extra) # لاگ اولیه دریافت
+                logger.debug("Received signal from queue.", extra=log_extra)
 
-                # --- مدیریت PING ---
                 if event_type == "PING" or event_type == "PING_COPY":
                     ea_type = "SourceEA" if event_type == "PING" else "CopyEA"
                     logger.info(f"{ea_type} ({log_extra['ea_id']}) is alive (PING received).", extra=log_extra)
-                    # برای PING کاری انجام نمی‌دهیم، فقط زنده بودن را ثبت می‌کنیم
 
-                # --- سیگنال‌های مستر (برای انتشار به کلاینت‌ها و هشدار تلگرام) ---
                 elif event_type in ["TRADE_OPEN", "TRADE_MODIFY", "TRADE_CLOSE_MASTER", "TRADE_PARTIAL_CLOSE_MASTER"]:
                     logger.info(f"Processing Master signal: {event_type}", extra=log_extra)
                     await self.publish_queue.put(signal_data)
@@ -138,32 +169,38 @@ class ZMQServer:
                         await telegram_alert_queue.put(msg)
                         logger.debug(f"Telegram alert sent for {event_type}.", extra=log_extra)
 
-                # --- گزارش‌های کلاینت کپی (برای ذخیره در دیتابیس و هشدار تلگرام) ---
                 elif event_type == "TRADE_CLOSED_COPY":
-                    logger.info(f"Processing Copy close report.", extra=log_extra)
                     profit = signal_data.get("profit", 0.0)
                     source_ticket = signal_data.get("source_ticket")
                     
-                    # --- ذخیره در دیتابیس با مدیریت خطای هوشمند ---
+                    log_extra.update({
+                        "profit": profit,
+                        "source_ticket": source_ticket
+                    })
+                    
+                    logger.info(f"Processing Copy close report.", extra=log_extra)
+                    
                     try:
-                        database.save_trade_history(
+                        # [بهبود عملکرد] فراخوانی مسدودکننده دیتابیس به یک ترد جداگانه منتقل شد
+                        await asyncio.to_thread(
+                            database.save_trade_history,
                             copy_id_str=log_extra['copy_id'],
                             source_id_str=log_extra['source_id'],
                             symbol=log_extra['symbol'],
                             profit=profit,
                             source_ticket=source_ticket
                         )
-                        logger.info("Trade history saved to DB.", extra=log_extra)
-                    except ValueError as ve: # خطای مربوط به پیدا نشدن حساب
+                        logger.info("Trade history saved to DB (non-blocking).", extra=log_extra)
+                        
+                    except ValueError as ve: 
                         logger.error(f"Failed to save trade history: {ve}", extra=log_extra)
                         if telegram_alert_queue:
                             await telegram_alert_queue.put(f"⚠️ *خطای ذخیره تاریخچه*\n\n{escape_markdown(str(ve), 2)}")
-                    except Exception as db_e: # سایر خطاهای دیتابیس
+                    except Exception as db_e: 
                         logger.error(f"Critical DB error saving trade history: {db_e}", exc_info=True, extra=log_extra)
                         if telegram_alert_queue:
                             await telegram_alert_queue.put(f"🚨 *خطای شدید دیتابیس*\n\n عدم موفقیت در ذخیره تاریخچه معامله `{log_extra['copy_id']}` از سورس `{log_extra['source_id']}`. جزئیات در لاگ سرور.")
 
-                    # --- ارسال هشدار تلگرام ---
                     emoji = "🔻" if profit < 0 else "✅"
                     msg = (
                         f"{emoji} *معامله کپی شده بسته شد*\n\n"
@@ -177,7 +214,6 @@ class ZMQServer:
                         await telegram_alert_queue.put(msg)
                         logger.debug("Telegram alert sent for TRADE_CLOSED_COPY.", extra=log_extra)
 
-                # --- خطاهای اکسپرت (گزارش شده توسط EA) ---
                 elif event_type == "EA_ERROR":
                     error_message = signal_data.get('message', 'No details provided.')
                     log_extra['error_message'] = error_message
@@ -191,37 +227,30 @@ class ZMQServer:
                         await telegram_alert_queue.put(msg)
                         logger.debug("Telegram alert sent for EA_ERROR.", extra=log_extra)
 
-                # --- رویدادهای ناشناخته ---
                 else:
-                    log_extra['raw_signal'] = signal_data # ثبت کل پیام ناشناخته
+                    log_extra['raw_signal'] = signal_data
                     logger.warning(f"Unknown event type received.", extra=log_extra)
                     if telegram_alert_queue:
-                        # ارسال هشدار به ادمین در مورد رویداد ناشناخته
                          await telegram_alert_queue.put(f"⚠️ *رویداد ناشناخته*\n\n سرور یک پیام با نوع `{event_type}` دریافت کرد که قادر به پردازش آن نیست. جزئیات در لاگ سرور.")
 
 
             except json.JSONDecodeError as json_err:
-                # خطای خاص در پارس کردن JSON ورودی
                 log_extra['error'] = str(json_err)
-                log_extra['raw_signal_on_error'] = signal_data # signal_data اینجا ممکن است رشته خام باشد
+                log_extra['raw_signal_on_error'] = signal_data
                 logger.error("Failed to decode JSON signal.", extra=log_extra)
                 if telegram_alert_queue:
                      await telegram_alert_queue.put("🚨 *خطای JSON*\n\n سرور پیامی دریافت کرد که قابل پارس کردن به عنوان JSON نبود. پیام خام در لاگ سرور ثبت شد.")
             
             except Exception as e:
-                # مدیریت خطای جامع برای کل فرآیند پردازش
                 log_extra['error'] = str(e)
-                log_extra['raw_signal_on_error'] = signal_data # ثبت داده‌ها هنگام خطا
+                log_extra['raw_signal_on_error'] = signal_data
                 logger.critical(f"Critical unhandled error in signal processing task: {e}", exc_info=True, extra=log_extra)
                 if telegram_alert_queue:
-                    # ارسال هشدار شدید به ادمین
                      await telegram_alert_queue.put(f"🆘 *خطای بحرانی در پردازشگر سیگنال*\n\n خطای پیش‌بینی نشده: `{escape_markdown(str(e), 2)}`. لطفاً لاگ‌های سرور را فوراً بررسی کنید.")
 
             finally:
-                # تضمین می‌کند که صف همیشه خالی می‌شود، حتی در صورت خطا
                 if self.processing_queue:
                      self.processing_queue.task_done()
-
 
 
 

@@ -12,6 +12,10 @@ input int InpPublishPort = 5556;
 input int InpSignalPort = 5555;
 input string InpCopyIDStr = "C_A";
 input ulong InpMagicNumber = 12345;
+input bool InpEnableDebugLogging = false;
+
+
+
 
 struct sSourceConfig {
     string SourceTopicID;
@@ -60,8 +64,25 @@ double g_daily_dd = 0.0;
 datetime g_last_dd_reset = 0;
 datetime g_last_recv_time = 0;
 string g_prev_topics[];
+int g_log_file_handle = INVALID_HANDLE;
+bool g_trading_stopped_by_dd = false;
 
+
+
+
+
+/******************************************************************
+ * مقداردهی اولیه اکسپرت، باز کردن فایل لاگ، و اتصال به ZMQ
+ ******************************************************************/
 int OnInit() {
+    // [جدید] باز کردن فایل لاگ در اولین قدم
+    string log_file_name = "CopyEA_" + InpCopyIDStr + ".log";
+    g_log_file_handle = FileOpen(log_file_name, FILE_WRITE|FILE_ANSI|FILE_TXT|FILE_SHARE_READ);
+    if(g_log_file_handle == INVALID_HANDLE)
+       {
+        Print("CRITICAL: [CopyEA] Could not open log file: " + log_file_name);
+       }
+
     if (StringLen(InpCopyIDStr) == 0) {
         LogEvent("ERROR", "Invalid InpCopyIDStr: empty");
         return(INIT_PARAMETERS_INCORRECT);
@@ -116,12 +137,16 @@ int OnInit() {
     return(INIT_SUCCEEDED);
 }
 
+
+
+
+/******************************************************************
+ * دریافت فایل تنظیمات از سرور هسته پایتون
+ ******************************************************************/
 bool FetchConfiguration() {
     LogEvent("INFO", "Attempting to fetch configuration for '" + InpCopyIDStr + "'");
-
     g_zmq_socket_req = ZmqSocketNew(g_zmq_context, ZMQ_REQ);
     string req_address = "tcp://" + InpServerAddress + ":" + (string)InpConfigPort;
-
     if (ZmqConnect(g_zmq_socket_req, req_address) != 0) {
         LogEvent("ERROR", "Failed to connect ZMQ REQ socket to " + req_address, ZmqErrno());
         return false;
@@ -130,7 +155,6 @@ bool FetchConfiguration() {
     g_json_builder.Init();
     g_json_builder.Add("command", "GET_CONFIG");
     g_json_builder.Add("copy_id_str", InpCopyIDStr);
-
     if (ZmqSendString(g_zmq_socket_req, g_json_builder.ToString(), 0) == -1) {
         LogEvent("ERROR", "Failed to send config request", ZmqErrno());
         ZmqClose(g_zmq_socket_req);
@@ -140,7 +164,6 @@ bool FetchConfiguration() {
     uchar recv_buffer[65536];
     int recv_len = ZmqRecv(g_zmq_socket_req, recv_buffer, 65536, 0);
     ZmqClose(g_zmq_socket_req);
-
     if (recv_len <= 0) {
         LogEvent("ERROR", "Failed to receive config response", ZmqErrno());
         return false;
@@ -167,12 +190,14 @@ bool FetchConfiguration() {
     g_global_config.ResetDDFlag = global_settings["reset_dd_flag"].ToBool();
 
     LogEvent("INFO", "Global settings loaded: DD=" + DoubleToString(g_global_config.DailyDrawdownPercent, 2) + "%, Alert=" + DoubleToString(g_global_config.AlertDrawdownPercent, 2) + "%");
-
+    
+    // [جدید] اعمال منطق ریست کردن DD
     if (g_global_config.ResetDDFlag) {
         g_daily_dd = 0.0;
         g_last_dd_reset = TimeCurrent();
-        g_global_config.ResetDDFlag = false;
-        LogEvent("INFO", "DD reset triggered on config fetch");
+        g_trading_stopped_by_dd = false; // <-- [مهم] اجازه ترید مجدد صادر شد
+        g_global_config.ResetDDFlag = false; 
+        LogEvent("INFO", "DD reset triggered by admin. Trading re-enabled.");
     }
 
     CJAVal mappings = config["mappings"];
@@ -196,15 +221,24 @@ bool FetchConfiguration() {
     return true;
 }
 
+
+
+/******************************************************************
+ * پاکسازی نهایی اکسپرت هنگام خروج
+ ******************************************************************/
 void OnDeinit(const int reason) {
     LogEvent("INFO", "Deinitializing Copy EA...");
 
     EventKillTimer();
     CleanupZMQ();
-
     LogEvent("INFO", "Copy EA Deinitialized.");
 }
 
+
+
+/******************************************************************
+ * پاکسازی تمام سوکت‌های ZMQ و بستن فایل لاگ
+ ******************************************************************/
 void CleanupZMQ() {
     if (g_zmq_socket_req != 0)
         ZmqClose(g_zmq_socket_req);
@@ -219,9 +253,25 @@ void CleanupZMQ() {
     g_zmq_socket_sub = 0;
     g_zmq_socket_push = 0;
     g_zmq_context = 0;
+
+    // [جدید] بستن فایل لاگ
+    if(g_log_file_handle != INVALID_HANDLE)
+       {
+        FileClose(g_log_file_handle);
+        g_log_file_handle = INVALID_HANDLE;
+       }
 }
 
+
+
+
+
+
+/******************************************************************
+ * مدیریت رویدادهای تایمر (ارسال پینگ، رفرش تنظیمات، پردازش صف)
+ ******************************************************************/
 void OnTimer() {
+    // 1. پردازش صف تلاش مجدد (ارسال گزارش‌های ناموفق)
     if (ArraySize(g_retry_queue) > 0) {
         RetryMessage msg = g_retry_queue[0];
         if (ZmqSendString(g_zmq_socket_push, msg.json, ZMQ_DONTWAIT) != -1) {
@@ -240,8 +290,12 @@ void OnTimer() {
         }
     }
 
-    g_timer_count++;
-    if (g_timer_count % 300 == 0) {
+    g_timer_count++; // [اصلاح شده] فقط یک بار در هر تیک تایمر افزایش می‌یابد
+
+    // 2. رفرش کردن تنظیمات (هر 10 دقیقه)
+    // [بهبود عملکرد] فاصله زمانی از 30 ثانیه (300) به 10 دقیقه (6000) افزایش یافت
+    // 100ms * 6000 = 600,000ms = 10 minutes
+    if (g_timer_count % 6000 == 0) { 
         if (!FetchConfiguration()) {
             LogEvent("WARN", "Config refresh failed");
         } else {
@@ -250,14 +304,15 @@ void OnTimer() {
         }
     }
 
-    g_timer_count++;
+    // 3. ارسال پینگ (هر 30 ثانیه)
+    // 100ms * 300 = 30,000ms = 30 seconds
     if (g_timer_count % 300 == 0) {
         g_json_builder.Init();
         g_json_builder.Add("event", "PING_COPY");
         g_json_builder.Add("copy_id_str", InpCopyIDStr);
         g_json_builder.Add("timestamp", (long)TimeCurrent());
         string ping_msg = g_json_builder.ToString();
-
+        
         if (ZmqSendString(g_zmq_socket_push, ping_msg, ZMQ_DONTWAIT) == -1) {
             LogEvent("WARN", "Ping send failed", ZmqErrno());
             g_ping_fails++;
@@ -267,14 +322,20 @@ void OnTimer() {
             }
         } else {
             g_ping_fails = 0;
-            LogEvent("INFO", "Ping sent successfully");
+            // لاگ پینگ موفق حذف شد تا لاگ‌ها فشرده (Compact) باشند
         }
     }
 
+    // 4. بررسی سیگنال‌های دریافتی (فقط اگر مدتی از دریافت قبلی گذشته باشد)
     if (TimeCurrent() - g_last_recv_time < 0.05) return;
 
     CheckSignalSocket();
 }
+
+
+
+
+
 
 void ReconnectSockets() {
     ZmqDisconnect(g_zmq_socket_sub, "tcp://" + InpServerAddress + ":" + (string)InpPublishPort);
@@ -289,6 +350,11 @@ void ReconnectSockets() {
         LogEvent("CRITICAL", "Reconnect failed", ZmqErrno());
     }
 }
+
+
+
+
+
 
 void UpdateSubscriptions() {
     for (int i = 0; i < ArraySize(g_prev_topics); i++) {
@@ -317,6 +383,11 @@ void UpdateSubscriptions() {
         }
     }
 }
+
+
+
+
+
 
 void CheckSignalSocket() {
     if (g_zmq_socket_sub == 0) return;
@@ -390,9 +461,40 @@ double GetSourceFloatingProfitLoss(string source_id_str)
 
 
 
-//+------------------------------------------------------------------+
-//| پردازش سیگنال دریافت شده از سرور                                  |
-//+------------------------------------------------------------------+
+/******************************************************************
+ * محاسبه مجموع سود/زیان شناور تمام معاملات باز این اکسپرت
+ ******************************************************************/
+double GetTotalFloatingPL()
+{
+    double total_profit_loss = 0.0;
+    int map_size = ArraySize(g_position_map);
+
+    for(int i = 0; i < map_size; i++)
+    {
+        if(PositionSelectByTicket(g_position_map[i].ticket))
+        {
+            total_profit_loss += PositionGetDouble(POSITION_PROFIT);
+        }
+        else
+        {
+            LogEvent("WARN", "Position ticket not found during DD (float) calculation, removing from map", g_position_map[i].ticket);
+            RemoveFromMap(g_position_map[i].ticket);
+            map_size--;
+            i--;
+        }
+    }
+    
+    return total_profit_loss;
+}
+
+
+
+
+
+
+/******************************************************************
+ * پردازش سیگنال دریافت شده از سرور (باز کردن، اصلاح، یا بستن معامله)
+ ******************************************************************/
 void ProcessSignal(string source_topic, string json_message)
 {
     CJAVal signal;
@@ -430,7 +532,6 @@ void ProcessSignal(string source_topic, string json_message)
     double sl = signal["position_sl"].ToDbl();
     double tp = signal["position_tp"].ToDbl();
     long position_type = signal["position_type"].ToInt();
-
     if(symbol == "" || (volume <= 0 && event_type == "TRADE_OPEN"))
     {
         LogEvent("ERROR", "Invalid signal data: symbol or volume", symbol);
@@ -484,7 +585,6 @@ void ProcessSignal(string source_topic, string json_message)
     final_volume = NormalizeDouble(final_volume / vol_step, 0) * vol_step;
     if(final_volume < vol_min) final_volume = vol_min;
     if(final_volume > vol_max) final_volume = vol_max;
-
     if(config.MaxLotSize > 0 && final_volume > config.MaxLotSize)
     {
         LogEvent("WARN", "Volume exceeds MaxLotSize, capping", final_volume);
@@ -494,9 +594,21 @@ void ProcessSignal(string source_topic, string json_message)
     string short_pos_id = IntegerToString((int)(source_pos_id % 100000000));
     string comment = short_pos_id + "|" + source_topic;
     if(StringLen(comment) > 31) comment = StringSubstr(comment, 0, 31);
-
+    
     if(event_type == "TRADE_OPEN")
     {
+        // [جدید] اعمال منطق کامل حد ضرر روزانه
+        // 1. ابتدا چک می‌کنیم آیا روز عوض شده تا g_daily_dd ریست شود
+        CheckDailyDrawdown(); 
+        
+        // 2. سپس حد ضرر کامل (شامل شناور) را چک می‌کنیم
+        if(CheckDailyDDLimit())
+        {
+            LogEvent("WARN", "Trade rejected: Daily Drawdown Limit has been reached.");
+            return;
+        }
+        // [پایان بخش جدید]
+        
         int concurrent = 0;
         for(int i = 0; i < ArraySize(g_position_map); i++)
         {
@@ -520,16 +632,8 @@ void ProcessSignal(string source_topic, string json_message)
             }
         }
 
-        CheckDailyDrawdown();
-
-        double point_value = SymbolInfoDouble(symbol, SYMBOL_POINT) * SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
-        double projected_profit = final_volume * point_value * (position_type == 0 ? (tp - price) : (price - tp));
-        if(g_daily_dd + projected_profit < -AccountEquity() * (g_global_config.DailyDrawdownPercent / 100.0))
-        {
-            LogEvent("WARN", "Trade rejected: exceeds daily DD limit", g_daily_dd + projected_profit);
-            return;
-        }
-
+        // [حذف شده] بلاک کد قدیمی و ناقص بررسی DD در اینجا حذف شد
+        
         LogEvent("INFO", "Executing OPEN: " + (position_type == 0 ? "BUY" : "SELL") + " " + symbol + " " + DoubleToString(final_volume, 2) + " lots from source " + source_topic);
         MqlTradeRequest req;
         ZeroMemory(req);
@@ -637,6 +741,54 @@ void ProcessSignal(string source_topic, string json_message)
 
 
 
+/******************************************************************
+ * بررسی می‌کند آیا حد ضرر روزانه (DD) فعال شده است یا خیر
+ * (شامل ضرر شناور + ضرر معاملات بسته شده)
+ ******************************************************************/
+bool CheckDailyDDLimit()
+{
+    // 1. اگر معاملات قبلاً به دلیل DD متوقف شده‌اند، همچنان متوقف بمان
+    if(g_trading_stopped_by_dd)
+    {
+        return true;
+    }
+
+    // 2. اگر حد ضرر روزانه در تنظیمات غیرفعال است (0%)، بررسی نکن
+    if(g_global_config.DailyDrawdownPercent <= 0.0)
+    {
+        return false;
+    }
+
+    // 3. محاسبه مقادیر
+    double current_equity = AccountEquity();
+    // محاسبه مبلغ ضرر مجاز (این عدد منفی خواهد بود)
+    double dd_limit_amount = -current_equity * (g_global_config.DailyDrawdownPercent / 100.0);
+
+    // 4. محاسبه ضرر کل فعلی
+    double floating_pl = GetTotalFloatingPL(); // (از قدم 3.2)
+    double total_current_dd = g_daily_dd + floating_pl; // g_daily_dd ضرر معاملات بسته شده است
+
+    // 5. بررسی نهایی
+    if(total_current_dd < dd_limit_amount)
+    {
+        // حد ضرر فعال شد!
+        g_trading_stopped_by_dd = true;
+        string err_msg = "CRITICAL: Daily Drawdown Limit Hit! Total DD: " + DoubleToString(total_current_dd, 2) +
+                         " (Limit: " + DoubleToString(dd_limit_amount, 2) + ")";
+                         
+        LogEvent("CRITICAL", err_msg);
+        SendErrorReport("Daily DD Limit Hit! Trading stopped.");
+        
+        // **اختیاری:** اگر می‌خواهید تمام معاملات باز فوراً بسته شوند،
+        // کد بستن همه معاملات را در اینجا اضافه کنید.
+        
+        return true;
+    }
+
+    // اگر به حد ضرر نرسیده است
+    return false;
+}
+
 
 
 
@@ -647,6 +799,10 @@ void CheckDailyDrawdown() {
         LogEvent("INFO", "Daily DD reset on new day");
     }
 }
+
+
+
+
 
 ulong FindPositionBySourceID(long source_pos_id) {
     for (int i = 0; i < ArraySize(g_position_map); i++) {
@@ -679,6 +835,10 @@ ulong FindPositionBySourceID(long source_pos_id) {
     }
     return 0;
 }
+
+
+
+
 
 void RemoveFromMap(ulong ticket) {
     for (int i = 0; i < ArraySize(g_position_map); i++) {
@@ -765,6 +925,10 @@ void SendCloseReport(ulong deal_ticket) {
     }
 }
 
+
+
+
+
 void SendErrorReport(string error_msg) {
     g_json_builder.Init();
     g_json_builder.Add("event", "EA_ERROR");
@@ -780,27 +944,51 @@ void SendErrorReport(string error_msg) {
     }
 }
 
+
+
+
+
+/******************************************************************
+ * لاگ‌نویسی هوشمند رویدادها با قابلیت فیلتر کردن سطح لاگ
+ ******************************************************************/
 void LogEvent(string level, string msg, variant extra = -1) {
+    // اگر لاگ از نوع اطلاعاتی بود و کاربر لاگ دیباگ را نخواسته بود، آن را نادیده بگیر
+    if (level == "INFO" && !InpEnableDebugLogging) {
+        return;
+    }
+
     datetime ts = TimeCurrent();
-    string log_str = TimeToString(ts, TIME_DATE|TIME_MINUTES|TIME_SECONDS) + " [" + level + "] [CopyEA]: " + msg;
+    // شناسه کپی (CopyID) به لاگ اضافه شد تا مشخص شود کدام اکسپرت لاگ می‌زند
+    string log_str = TimeToString(ts, TIME_DATE|TIME_MINUTES|TIME_SECONDS) + " [" + level + "] [CopyEA-" + InpCopyIDStr + "]: " + msg;
+
     if (extra != -1) {
         log_str += " {" + VariantToString(extra) + "}";
     }
-    Print(log_str);
 
-    if (level == "ERROR" || level == "CRITICAL") {
-        int file = FileOpen("CopyEA.log", FILE_WRITE|FILE_ANSI|FILE_TXT|FILE_SHARE_READ);
-        if (file != INVALID_HANDLE) {
-            FileSeek(file, 0, SEEK_END);
-            FileWrite(file, log_str);
-            FileClose(file);
-        }
-        if (level == "CRITICAL") {
-            ExpertRemove();
-        }
+    // فقط سطوح هشدار به بالا را در ترمینال چاپ کن تا خلوت بماند
+    if (level == "WARN" || level == "ERROR" || level == "CRITICAL") {
+        Print(log_str);
+    }
+
+    // *تمام* لاگ‌ها (شامل INFO) را در فایل بنویس (با استفاده از هندل باز شده)
+    if(g_log_file_handle != INVALID_HANDLE) {
+        FileSeek(g_log_file_handle, 0, SEEK_END);
+        FileWrite(g_log_file_handle, log_str + "\r\n");
+    }
+
+    // اگر لاگ بحرانی بود، اکسپرت را متوقف کن
+    if (level == "CRITICAL") {
+        ExpertRemove();
     }
 }
 
+
+
+
+
+/******************************************************************
+ * تابع کمکی برای تبدیل انواع داده به رشته (برای لاگ)
+ ******************************************************************/
 string VariantToString(variant v) {
     if (typename(v) == "long" || typename(v) == "int") {
         return "extra:" + IntegerToString((int)v);

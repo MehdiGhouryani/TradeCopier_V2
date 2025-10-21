@@ -488,65 +488,61 @@ def get_full_status_report():
 
 # === توابع آمار ===
 
+# /******************************************************************
+#  * محاسبه خلاصه آمار سود/زیان و تعداد معاملات با فیلتر زمانی
+#  ******************************************************************/
 def get_statistics_summary(time_filter: str = "all") -> list[dict]:
-    """محاسبه خلاصه آمار سود/زیان و تعداد معاملات با فیلتر زمانی."""
     with get_db_session() as db:
-        # شروع کوئری با انتخاب ستون‌های لازم و توابع تجمعی
         query = db.query(
             TradeHistory.copy_account_id,
             TradeHistory.source_account_id,
             CopyAccount.name.label('copy_name'),
-            SourceAccount.name.label('source_name'), # ممکن است NULL باشد
+            SourceAccount.name.label('source_name'), 
             func.sum(TradeHistory.profit).label('total_profit'),
             func.count(TradeHistory.id).label('trade_count')
         ).select_from(TradeHistory)\
          .join(CopyAccount, TradeHistory.copy_account_id == CopyAccount.id)\
-         .outerjoin(SourceAccount, TradeHistory.source_account_id == SourceAccount.id) # Left join برای منابع حذف شده
+         .outerjoin(SourceAccount, TradeHistory.source_account_id == SourceAccount.id)
 
-        # اعمال فیلتر زمانی
         now = datetime.datetime.utcnow()
         start_date = None
         if time_filter == "today":
             start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
         elif time_filter == "7d":
             start_date = now - datetime.timedelta(days=7)
-            start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0) # شروع از ابتدای روز هفتم
-        # elif time_filter == "30d": # (فعلا غیرفعال)
-        #     start_date = now - datetime.timedelta(days=30)
-        #     start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+            start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        # [جدید] شرط 30d فعال شد
+        elif time_filter == "30d": 
+            start_date = now - datetime.timedelta(days=30)
+            start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
 
         if start_date:
             query = query.filter(TradeHistory.timestamp >= start_date)
 
-        # گروه‌بندی نتایج
         query = query.group_by(
             TradeHistory.copy_account_id,
             TradeHistory.source_account_id,
             CopyAccount.name,
             SourceAccount.name
         ).order_by(
-            CopyAccount.name, # مرتب‌سازی بر اساس نام حساب کپی
-            SourceAccount.name # سپس بر اساس نام منبع
+            CopyAccount.name, 
+            SourceAccount.name 
         )
 
-        # اجرای کوئری و تبدیل نتایج به لیست دیکشنری
         results = query.all()
 
-        # تبدیل نتایج SQLAlchemy Row به دیکشنری‌های ساده
         summary_list = [
             {
                 "copy_account_id": r.copy_account_id,
                 "source_account_id": r.source_account_id,
                 "copy_name": r.copy_name,
-                "source_name": r.source_name if r.source_account_id else "نامشخص/حذف شده", # مدیریت منبع حذف شده
+                "source_name": r.source_name if r.source_account_id else "نامشخص/حذف شده", 
                 "total_profit": r.total_profit,
                 "trade_count": r.trade_count
             } for r in results
         ]
         logger.info(f"Statistics summary generated for filter '{time_filter}'. Found {len(summary_list)} grouped results.")
         return summary_list
-
-
 
 
 def get_config_for_copy_ea(copy_id_str: str) -> dict:

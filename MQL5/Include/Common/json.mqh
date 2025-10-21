@@ -1,8 +1,3 @@
-// MQL5/Include/Common/json.mqh
-//
-// یک کلاس کمکی بسیار ساده برای ساختن رشته‌های JSON
-// MQL5 در خواندن JSON خوب است اما در ساختن آن ضعیف است.
-
 #property strict
 
 class CJsonBuilder

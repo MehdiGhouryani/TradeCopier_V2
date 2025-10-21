@@ -40,10 +40,13 @@ struct PositionMap {
     string source_id_str;
 };
 
-struct RetryMessage {
-    string json;
-    int attempts;
+struct RetryMessage
+{
+    int    attempts;    // تعداد تلاش‌ها
+    int    data_len;    // طول واقعی داده
+    uchar  json_data[MAX_MSG_SIZE]; // داده به صورت بایت (نه آبجکت string)
 };
+
 
 CTrade g_trade;
 CJsonBuilder g_json_builder;
@@ -84,7 +87,7 @@ int OnInit() {
        }
 
     if (StringLen(InpCopyIDStr) == 0) {
-        LogEvent("ERROR", "Invalid InpCopyIDStr: empty");
+        LogEvent("ERROR", "Invalid InpCopyIDStr: empty", 0);
         return(INIT_PARAMETERS_INCORRECT);
     }
     if (InpMagicNumber == 0) {
@@ -140,86 +143,271 @@ int OnInit() {
 
 
 
-/******************************************************************
- * دریافت فایل تنظیمات از سرور هسته پایتون
- ******************************************************************/
-bool FetchConfiguration() {
-    LogEvent("INFO", "Attempting to fetch configuration for '" + InpCopyIDStr + "'");
+//+------------------------------------------------------------------+
+//| توابع کمکی برای پارس کردن دستی JSON
+//+------------------------------------------------------------------+
+
+// تابع برای استخراج مقدار رشته‌ای از JSON
+string JsonGetString(const string& json, const string& key)
+{
+    string key_pattern = "\"" + key + "\":\"";
+    int start_pos = StringFind(json, key_pattern);
+    if(start_pos < 0) return ""; // کلید یافت نشد
+
+    start_pos += StringLen(key_pattern);
+    int end_pos = StringFind(json, "\"", start_pos);
+    if(end_pos < 0) return ""; // خطای فرمت
+
+    // استخراج و حذف بک‌اسلش‌های escape شده
+    string value = StringSubstr(json, start_pos, end_pos - start_pos);
+    StringReplace(value, "\\\\", "\\"); // \\ -> \
+    StringReplace(value, "\\\"", "\""); // \" -> "
+    // ... (می‌توان موارد دیگر مانند \n, \t را نیز اضافه کرد)
+    return value;
+}
+
+// تابع برای استخراج مقدار عددی (double) از JSON
+double JsonGetDouble(const string& json, const string& key)
+{
+    string key_pattern = "\"" + key + "\":";
+    int start_pos = StringFind(json, key_pattern);
+    if(start_pos < 0) return 0.0; // کلید یافت نشد
+
+    start_pos += StringLen(key_pattern);
+    // پیدا کردن پایان عدد (ویرگول یا آکولاد بسته)
+    int end_pos1 = StringFind(json, ",", start_pos);
+    int end_pos2 = StringFind(json, "}", start_pos);
+    int end_pos = -1;
+
+    if(end_pos1 >= 0 && end_pos2 >= 0) end_pos = MathMin(end_pos1, end_pos2);
+    else if(end_pos1 >= 0) end_pos = end_pos1;
+    else if(end_pos2 >= 0) end_pos = end_pos2;
+
+    if(end_pos < 0) return 0.0; // خطای فرمت
+
+    string value_str = StringSubstr(json, start_pos, end_pos - start_pos);
+    return StringToDouble(value_str);
+}
+
+// تابع برای استخراج مقدار عددی (long) از JSON
+long JsonGetLong(const string& json, const string& key)
+{
+    // مشابه JsonGetDouble اما با StringToInteger
+    string key_pattern = "\"" + key + "\":";
+    int start_pos = StringFind(json, key_pattern);
+    if(start_pos < 0) return 0;
+
+    start_pos += StringLen(key_pattern);
+    int end_pos1 = StringFind(json, ",", start_pos);
+    int end_pos2 = StringFind(json, "}", start_pos);
+    int end_pos = -1;
+
+    if(end_pos1 >= 0 && end_pos2 >= 0) end_pos = MathMin(end_pos1, end_pos2);
+    else if(end_pos1 >= 0) end_pos = end_pos1;
+    else if(end_pos2 >= 0) end_pos = end_pos2;
+
+    if(end_pos < 0) return 0;
+
+    string value_str = StringSubstr(json, start_pos, end_pos - start_pos);
+    return StringToInteger(value_str);
+}
+
+
+// تابع برای استخراج مقدار بولی (boolean) از JSON
+bool JsonGetBool(const string& json, const string& key)
+{
+    string key_pattern = "\"" + key + "\":";
+    int start_pos = StringFind(json, key_pattern);
+    if(start_pos < 0) return false;
+
+    start_pos += StringLen(key_pattern);
+    // پیدا کردن پایان مقدار بولی (true یا false)
+    int end_pos1 = StringFind(json, ",", start_pos);
+    int end_pos2 = StringFind(json, "}", start_pos);
+    int end_pos = -1;
+
+    if(end_pos1 >= 0 && end_pos2 >= 0) end_pos = MathMin(end_pos1, end_pos2);
+    else if(end_pos1 >= 0) end_pos = end_pos1;
+    else if(end_pos2 >= 0) end_pos = end_pos2;
+
+    if(end_pos < 0) return false;
+
+    string value_str = StringSubstr(json, start_pos, end_pos - start_pos);
+    StringTrim(value_str); // حذف فضاهای احتمالی
+    return (value_str == "true");
+}
+
+
+//+------------------------------------------------------------------+
+//| [بازنویسی شده] دریافت و پارس کردن تنظیمات از سرور (بدون CJAVal)
+//+------------------------------------------------------------------+
+bool FetchConfiguration()
+{
+    LogEvent("INFO", "Attempting to fetch configuration for '" + InpCopyIDStr + "'", 0);
     g_zmq_socket_req = ZmqSocketNew(g_zmq_context, ZMQ_REQ);
     string req_address = "tcp://" + InpServerAddress + ":" + (string)InpConfigPort;
-    if (ZmqConnect(g_zmq_socket_req, req_address) != 0) {
+    if (ZmqConnect(g_zmq_socket_req, req_address) != 0)
+    {
         LogEvent("ERROR", "Failed to connect ZMQ REQ socket to " + req_address, ZmqErrno());
         return false;
     }
 
+    // ارسال درخواست
     g_json_builder.Init();
     g_json_builder.Add("command", "GET_CONFIG");
     g_json_builder.Add("copy_id_str", InpCopyIDStr);
-    if (ZmqSendString(g_zmq_socket_req, g_json_builder.ToString(), 0) == -1) {
+    if (ZmqSendString(g_zmq_socket_req, g_json_builder.ToString(), 0) == -1)
+    {
         LogEvent("ERROR", "Failed to send config request", ZmqErrno());
         ZmqClose(g_zmq_socket_req);
         return false;
     }
 
-    uchar recv_buffer[65536];
+    // دریافت پاسخ
+    uchar recv_buffer[65536]; // بافر بزرگ برای تنظیمات حجیم
     int recv_len = ZmqRecv(g_zmq_socket_req, recv_buffer, 65536, 0);
-    ZmqClose(g_zmq_socket_req);
-    if (recv_len <= 0) {
+    ZmqClose(g_zmq_socket_req); // بستن سوکت REQ بلافاصله پس از دریافت
+    if (recv_len <= 0)
+    {
         LogEvent("ERROR", "Failed to receive config response", ZmqErrno());
         return false;
     }
 
-    string json_response = CharArrayToString(recv_buffer, 0, recv_len);
+    string json_response = CharArrayToString(recv_buffer, 0, recv_len, CP_UTF8);
 
-    CJAVal json_data;
-    if (!json_data.Deserialize(json_response)) {
-        LogEvent("ERROR", "Failed to deserialize JSON response: " + json_response);
+    // --- [بازنویسی شده] پارس کردن دستی JSON ---
+    LogEvent("DEBUG", "Received config JSON: " + json_response, 0); // لاگ دیباگ (اختیاری)
+
+    // 1. بررسی وضعیت کلی
+    string status = JsonGetString(json_response, "status");
+    if (status != "OK")
+    {
+        string message = JsonGetString(json_response, "message");
+        LogEvent("ERROR", "Server returned an error: " + message, 0);
         return false;
     }
 
-    if (json_data["status"].ToStr() != "OK") {
-        LogEvent("ERROR", "Server returned an error: " + json_data["message"].ToStr());
+    // 2. پیدا کردن آبجکت "config"
+    int config_start = StringFind(json_response, "\"config\":{");
+    if (config_start < 0)
+    {
+        LogEvent("ERROR", "Could not find 'config' object in JSON response", 0);
         return false;
     }
+    config_start += StringLen("\"config\":{"); // رفتن به ابتدای محتوای آبجکت
+    // پیدا کردن آکولاد بسته متناظر (این بخش ساده‌سازی شده و ممکن است برای JSONهای پیچیده خطا دهد)
+    int config_end = StringFind(json_response, "}}", config_start); // فرض می‌کنیم config آخرین بخش است
+     if (config_end < 0) config_end = StringLen(json_response) -1; // اگر آخرین بخش نبود
+     else config_end +=1; // شامل } دوم هم بشود
+     
+    string config_json = StringSubstr(json_response, config_start, config_end - config_start );
+     if (StringLen(config_json) > 0 && StringGetCharacter(config_json, StringLen(config_json)-1) != '}') // افزودن } پایانی اگر لازم بود
+     {
+      config_json = StringSubstr(json_response, config_start, config_end - config_start +1); // یک کاراکتر بیشتر بخوان
+     }
+      
 
-    CJAVal config = json_data["config"];
 
-    CJAVal global_settings = config["global_settings"];
-    g_global_config.DailyDrawdownPercent = global_settings["daily_drawdown_percent"].ToDbl();
-    g_global_config.AlertDrawdownPercent = global_settings["alert_drawdown_percent"].ToDbl();
-    g_global_config.ResetDDFlag = global_settings["reset_dd_flag"].ToBool();
+    // 3. پارس کردن "global_settings"
+    int gs_start = StringFind(config_json, "\"global_settings\":{");
+    if (gs_start < 0)
+    {
+        LogEvent("ERROR", "Could not find 'global_settings' in config JSON", 0);
+        return false;
+    }
+    gs_start += StringLen("\"global_settings\":{");
+    int gs_end = StringFind(config_json, "}", gs_start);
+    if (gs_end < 0)
+    {
+        LogEvent("ERROR", "Could not find end of 'global_settings' in config JSON", 0);
+        return false;
+    }
+    string gs_json = StringSubstr(config_json, gs_start, gs_end - gs_start);
 
-    LogEvent("INFO", "Global settings loaded: DD=" + DoubleToString(g_global_config.DailyDrawdownPercent, 2) + "%, Alert=" + DoubleToString(g_global_config.AlertDrawdownPercent, 2) + "%");
-    
-    // [جدید] اعمال منطق ریست کردن DD
-    if (g_global_config.ResetDDFlag) {
+    g_global_config.DailyDrawdownPercent = JsonGetDouble(gs_json, "daily_drawdown_percent");
+    g_global_config.AlertDrawdownPercent = JsonGetDouble(gs_json, "alert_drawdown_percent");
+    g_global_config.ResetDDFlag = JsonGetBool(gs_json, "reset_dd_flag");
+
+    LogEvent("INFO", "Global settings loaded: DD=" + DoubleToString(g_global_config.DailyDrawdownPercent, 2) + "%, Alert=" + DoubleToString(g_global_config.AlertDrawdownPercent, 2) + "%", 0);
+
+    // اعمال منطق ریست کردن DD
+    if (g_global_config.ResetDDFlag)
+    {
         g_daily_dd = 0.0;
         g_last_dd_reset = TimeCurrent();
-        g_trading_stopped_by_dd = false; // <-- [مهم] اجازه ترید مجدد صادر شد
-        g_global_config.ResetDDFlag = false; 
-        LogEvent("INFO", "DD reset triggered by admin. Trading re-enabled.");
+        g_trading_stopped_by_dd = false;
+        g_global_config.ResetDDFlag = false; // فلگ را مصرف کن
+        LogEvent("INFO", "DD reset triggered by admin. Trading re-enabled.", 0);
+        // نکته: برای ذخیره دائمی False شدن فلگ، نیاز به ارسال پاسخ به سرور است (در این پیاده‌سازی نیست)
     }
 
-    CJAVal mappings = config["mappings"];
-    int mappings_count = mappings.Size();
-    ArrayResize(g_source_configs, mappings_count);
+    // 4. پارس کردن آرایه "mappings"
+    int mappings_start = StringFind(config_json, "\"mappings\":[");
+    if (mappings_start < 0)
+    {
+        LogEvent("WARN", "No 'mappings' array found in config JSON", 0);
+        ArrayResize(g_source_configs, 0); // اگر مپینگ نبود، آرایه را خالی کن
+        return true; // عدم وجود مپینگ لزوما خطا نیست
+    }
+    mappings_start += StringLen("\"mappings\":[");
+    int mappings_end = StringFind(config_json, "]", mappings_start);
+    if (mappings_end < 0)
+    {
+        LogEvent("ERROR", "Could not find end of 'mappings' array in config JSON", 0);
+        return false;
+    }
+    string mappings_content = StringSubstr(config_json, mappings_start, mappings_end - mappings_start);
 
-    for (int i = 0; i < mappings_count; i++) {
-        CJAVal m = mappings[i];
-        g_source_configs[i].SourceTopicID = m["source_topic_id"].ToStr();
-        g_source_configs[i].CopyMode = m["copy_mode"].ToStr();
-        g_source_configs[i].AllowedSymbols = m["allowed_symbols"].ToStr();
-        g_source_configs[i].VolumeType = m["volume_type"].ToStr();
-        g_source_configs[i].VolumeValue = m["volume_value"].ToDbl();
-        g_source_configs[i].MaxLotSize = m["max_lot_size"].ToDbl();
-        g_source_configs[i].MaxConcurrentTrades = (int)m["max_concurrent_trades"].ToInt();
-        g_source_configs[i].SourceDrawdownLimit = m["source_drawdown_limit"].ToDbl();
-
-        LogEvent("INFO", "Mapping #" + IntegerToString(i) + " loaded: Source=" + g_source_configs[i].SourceTopicID + ", Vol=" + DoubleToString(g_source_configs[i].VolumeValue, 2) + " (" + g_source_configs[i].VolumeType + ")");
+    // شمردن تعداد آبجکت‌های مپینگ (بر اساس '{')
+    int current_pos = 0;
+    int mappings_count = 0;
+    while(StringFind(mappings_content, "{", current_pos) >= 0)
+    {
+        mappings_count++;
+        current_pos = StringFind(mappings_content, "{", current_pos) + 1;
     }
 
-    return true;
+    ArrayResize(g_source_configs, mappings_count); // تغییر اندازه آرایه گلوبال
+    current_pos = 0; // ریست کردن پوزیشن برای حلقه اصلی
+
+    for (int i = 0; i < mappings_count; i++)
+    {
+        int map_obj_start = StringFind(mappings_content, "{", current_pos);
+        if (map_obj_start < 0) break; // آبجکت دیگری یافت نشد
+        int map_obj_end = StringFind(mappings_content, "}", map_obj_start);
+        if (map_obj_end < 0) break; // خطای فرمت
+
+        string map_json = StringSubstr(mappings_content, map_obj_start + 1, map_obj_end - map_obj_start - 1);
+
+        // استخراج مقادیر برای هر مپینگ
+        g_source_configs[i].SourceTopicID = JsonGetString(map_json, "source_topic_id");
+        g_source_configs[i].CopyMode = JsonGetString(map_json, "copy_mode");
+        // برای allowed_symbols که ممکن است null باشد، JsonGetString مقدار "" برمی‌گرداند که اوکی است
+        g_source_configs[i].AllowedSymbols = JsonGetString(map_json, "allowed_symbols");
+        g_source_configs[i].VolumeType = JsonGetString(map_json, "volume_type");
+        g_source_configs[i].VolumeValue = JsonGetDouble(map_json, "volume_value");
+        g_source_configs[i].MaxLotSize = JsonGetDouble(map_json, "max_lot_size");
+        g_source_configs[i].MaxConcurrentTrades = (int)JsonGetLong(map_json, "max_concurrent_trades"); // تبدیل long به int
+        g_source_configs[i].SourceDrawdownLimit = JsonGetDouble(map_json, "source_drawdown_limit");
+
+        // اعتبارسنجی ساده (مثلاً VolumeType باید معتبر باشد)
+        if(g_source_configs[i].VolumeType != "MULTIPLIER" && g_source_configs[i].VolumeType != "FIXED")
+        {
+             LogEvent("WARN", "Invalid VolumeType '" + g_source_configs[i].VolumeType + "' for mapping " + g_source_configs[i].SourceTopicID + ". Defaulting to MULTIPLIER.", 0);
+             g_source_configs[i].VolumeType = "MULTIPLIER";
+             g_source_configs[i].VolumeValue = 1.0;
+        }
+
+
+        LogEvent("INFO", "Mapping #" + IntegerToString(i) + " loaded: Source=" + g_source_configs[i].SourceTopicID + ", Vol=" + DoubleToString(g_source_configs[i].VolumeValue, 2) + " (" + g_source_configs[i].VolumeType + ")", 0);
+
+        current_pos = map_obj_end + 1; // برو به بعد از آبجکت فعلی
+    }
+
+    return true; // موفقیت‌آمیز بود
 }
+//+------------------------------------------------------------------+
+
 
 
 
@@ -267,71 +455,102 @@ void CleanupZMQ() {
 
 
 
+
 /******************************************************************
- * مدیریت رویدادهای تایمر (ارسال پینگ، رفرش تنظیمات، پردازش صف)
+ * [بازنویسی شده] مدیریت رویدادهای تایمر
+ * 1. پردازش صف تلاش مجدد (با struct امن uchar[])
+ * 2. رفرش تنظیمات دوره‌ای
+ * 3. ارسال پینگ دوره‌ای
+ * 4. بررسی سوکت سیگنال‌ها
  ******************************************************************/
-void OnTimer() {
-    // 1. پردازش صف تلاش مجدد (ارسال گزارش‌های ناموفق)
-    if (ArraySize(g_retry_queue) > 0) {
-        RetryMessage msg = g_retry_queue[0];
-        if (ZmqSendString(g_zmq_socket_push, msg.json, ZMQ_DONTWAIT) != -1) {
-            LogEvent("INFO", "Retry report send successful");
-            ArrayCopy(g_retry_queue, g_retry_queue, 0, 1);
-            ArrayResize(g_retry_queue, ArraySize(g_retry_queue) - 1);
-        } else {
+void OnTimer()
+{
+    // --- 1. [بازنویسی شده] پردازش صف تلاش مجدد ---
+    if (ArraySize(g_retry_queue) > 0)
+    {
+        RetryMessage msg;
+        // کپی کردن داده‌های struct (امن است چون آبجکت ندارد)
+        msg = g_retry_queue[0];
+
+        // ارسال مستقیم آرایه بایت (uchar[])
+        if (ZmqSend(g_zmq_socket_push, msg.json_data, msg.data_len, ZMQ_DONTWAIT) != -1)
+        {
+            // [اصلاح شده] اکنون ArrayRemove روی g_retry_queue کار می‌کند
+            ArrayRemove(g_retry_queue, 0);
+            // لاگ موفقیت حذف شد برای فشرده‌سازی
+        }
+        else
+        {
             int err = ZmqErrno();
+            // فقط در صورت خطا لاگ می‌نویسیم
             LogEvent("WARN", "Retry report send failed", err);
+            // تلاش را افزایش می‌دهیم (فقط در متادیتای صف اصلی)
             g_retry_queue[0].attempts++;
-            if (g_retry_queue[0].attempts >= 3) {
+
+            // اگر به حداکثر تلاش رسید، پیام را حذف کن
+            if (g_retry_queue[0].attempts >= 3)
+            {
                 LogEvent("ERROR", "Max retries reached for report, discarding");
-                ArrayCopy(g_retry_queue, g_retry_queue, 0, 1);
-                ArrayResize(g_retry_queue, ArraySize(g_retry_queue) - 1);
+                ArrayRemove(g_retry_queue, 0); // حذف پیام از صف
             }
         }
     }
 
-    g_timer_count++; // [اصلاح شده] فقط یک بار در هر تیک تایمر افزایش می‌یابد
+    // --- افزایش شمارنده تایمر ---
+    g_timer_count++;
 
-    // 2. رفرش کردن تنظیمات (هر 10 دقیقه)
-    // [بهبود عملکرد] فاصله زمانی از 30 ثانیه (300) به 10 دقیقه (6000) افزایش یافت
+    // --- 2. رفرش کردن تنظیمات (هر 10 دقیقه) ---
     // 100ms * 6000 = 600,000ms = 10 minutes
-    if (g_timer_count % 6000 == 0) { 
-        if (!FetchConfiguration()) {
-            LogEvent("WARN", "Config refresh failed");
-        } else {
-            UpdateSubscriptions();
-            LogEvent("INFO", "Config refreshed successfully");
+    if (g_timer_count % 6000 == 0)
+    {
+        if (!FetchConfiguration())
+        {
+            // لاگ خطا داخل FetchConfiguration زده می‌شود
+            LogEvent("WARN", "Config refresh failed", 0);
+        }
+        else
+        {
+            UpdateSubscriptions(); // اشتراک‌ها را بر اساس تنظیمات جدید آپدیت کن
+            LogEvent("INFO", "Config refreshed successfully", 0);
         }
     }
 
-    // 3. ارسال پینگ (هر 30 ثانیه)
+    // --- 3. ارسال پینگ (هر 30 ثانیه) ---
     // 100ms * 300 = 30,000ms = 30 seconds
-    if (g_timer_count % 300 == 0) {
+    if (g_timer_count % 300 == 0)
+    {
         g_json_builder.Init();
         g_json_builder.Add("event", "PING_COPY");
         g_json_builder.Add("copy_id_str", InpCopyIDStr);
         g_json_builder.Add("timestamp", (long)TimeCurrent());
         string ping_msg = g_json_builder.ToString();
-        
-        if (ZmqSendString(g_zmq_socket_push, ping_msg, ZMQ_DONTWAIT) == -1) {
+
+        if (ZmqSendString(g_zmq_socket_push, ping_msg, ZMQ_DONTWAIT) == -1)
+        {
             LogEvent("WARN", "Ping send failed", ZmqErrno());
             g_ping_fails++;
-            if (g_ping_fails >= 3) {
+            if (g_ping_fails >= 3)
+            {
                 LogEvent("ERROR", "Multiple ping fails, attempting reconnect", g_ping_fails);
-                ReconnectSockets();
+                ReconnectSockets(); // تلاش برای اتصال مجدد
             }
-        } else {
-            g_ping_fails = 0;
-            // لاگ پینگ موفق حذف شد تا لاگ‌ها فشرده (Compact) باشند
+        }
+        else
+        {
+            g_ping_fails = 0; // در صورت موفقیت، شمارنده خطا ریست می‌شود
+            // لاگ پینگ موفق حذف شد
         }
     }
 
-    // 4. بررسی سیگنال‌های دریافتی (فقط اگر مدتی از دریافت قبلی گذشته باشد)
-    if (TimeCurrent() - g_last_recv_time < 0.05) return;
+    // --- 4. بررسی سیگنال‌های دریافتی ---
+    // برای جلوگیری از بار زیاد CPU، فقط اگر مدتی کوتاه از دریافت قبلی گذشته باشد، چک کن
+    // (این بخش تغییری نکرده است)
+    if (TimeCurrent() - g_last_recv_time < 0.05)
+         return; // اگر کمتر از 50 میلی‌ثانیه گذشته، خارج شو
 
-    CheckSignalSocket();
+    CheckSignalSocket(); // سوکت SUB را برای پیام‌های جدید چک کن
 }
-
+//+------------------------------------------------------------------+
 
 
 
@@ -355,76 +574,128 @@ void ReconnectSockets() {
 
 
 
+//+------------------------------------------------------------------+
+//| [بازنویسی شده] بروزرسانی اشتراک‌های ZMQ بر اساس تنظیمات جدید
+//| از ZmqSocketSetBytes برای Subscribe/Unsubscribe استفاده می‌کند
+//+------------------------------------------------------------------+
+void UpdateSubscriptions()
+{
+    // اگر سوکت SUB معتبر نیست، خارج شو
+    if (g_zmq_socket_sub == 0)
+        return;
 
-void UpdateSubscriptions() {
-    for (int i = 0; i < ArraySize(g_prev_topics); i++) {
+    // --- لغو اشتراک تاپیک‌های قبلی ---
+    for (int i = 0; i < ArraySize(g_prev_topics); i++)
+    {
+        // تبدیل رشته تاپیک قبلی به بایت
         uchar topic_array[];
-        StringToCharArray(g_prev_topics[i], topic_array);
-        ZmqSocketSet(g_zmq_socket_sub, ZMQ_UNSUBSCRIBE, topic_array);
-        LogEvent("INFO", "Unsubscribed from old topic: " + g_prev_topics[i]);
+        int len = StringToCharArray(g_prev_topics[i], topic_array, 0, -1, CP_UTF8) - 1;
+
+        // [اصلاح شده] استفاده از ZmqSocketSetBytes
+        if (ZmqSocketSetBytes(g_zmq_socket_sub, ZMQ_UNSUBSCRIBE, topic_array, len) != 0)
+        {
+             LogEvent("ERROR", "Failed to unsubscribe from old topic: " + g_prev_topics[i], ZmqErrno());
+        }
+        else
+        {
+             LogEvent("INFO", "Unsubscribed from old topic: " + g_prev_topics[i], 0);
+        }
     }
 
+    // تغییر اندازه آرایه تاپیک‌های قبلی برای ذخیره تاپیک‌های جدید
     ArrayResize(g_prev_topics, ArraySize(g_source_configs));
 
+    // --- اشتراک تاپیک‌های جدید ---
     int mappings_count = ArraySize(g_source_configs);
-    if (mappings_count == 0) {
-        LogEvent("WARN", "No active mappings, nothing to copy");
+    if (mappings_count == 0)
+    {
+        LogEvent("WARN", "No active mappings found in config, nothing to copy", 0);
     }
 
-    for (int i = 0; i < mappings_count; i++) {
+    for (int i = 0; i < mappings_count; i++)
+    {
         string topic = g_source_configs[i].SourceTopicID;
+        // تبدیل رشته تاپیک جدید به بایت
         uchar topic_array[];
-        StringToCharArray(topic, topic_array);
-        if (ZmqSocketSet(g_zmq_socket_sub, ZMQ_SUBSCRIBE, topic_array) != 0) {
+        int len = StringToCharArray(topic, topic_array, 0, -1, CP_UTF8) - 1;
+
+        // [اصلاح شده] استفاده از ZmqSocketSetBytes
+        if (ZmqSocketSetBytes(g_zmq_socket_sub, ZMQ_SUBSCRIBE, topic_array, len) != 0)
+        {
             LogEvent("ERROR", "Failed to subscribe to topic '" + topic + "'", ZmqErrno());
-        } else {
-            LogEvent("INFO", "Subscribed to topic: '" + topic + "'");
-            g_prev_topics[i] = topic;
+        }
+        else
+        {
+            LogEvent("INFO", "Subscribed to topic: '" + topic + "'", 0);
+            g_prev_topics[i] = topic; // ذخیره تاپیک فعلی برای لغو اشتراک در آینده
         }
     }
 }
+//+------------------------------------------------------------------+
 
 
 
+//+------------------------------------------------------------------+
+//| [بازنویسی شده] بررسی سوکت SUB برای سیگنال‌های جدید
+//| و اصلاح فراخوانی ZmqSocketGet
+//+------------------------------------------------------------------+
+void CheckSignalSocket()
+{
+    // اگر سوکت SUB معتبر نیست، خارج شو
+    if (g_zmq_socket_sub == 0)
+        return;
 
-
-
-void CheckSignalSocket() {
-    if (g_zmq_socket_sub == 0) return;
-
-    uchar recv_buffer[4096];
+    uchar recv_buffer[4096]; // بافر دریافت
     string topic_received;
     string json_message;
 
-    while (true) {
+    // حلقه برای خواندن تمام پیام‌های موجود در سوکت (non-blocking)
+    while (true)
+    {
+        // 1. خواندن بخش اول: تاپیک
         int topic_len = ZmqRecv(g_zmq_socket_sub, recv_buffer, 4096, ZMQ_DONTWAIT);
-        if (topic_len <= 0) break;
+        // اگر پیامی نبود یا خطایی رخ داد، از حلقه خارج شو
+        if (topic_len <= 0)
+            break;
 
-        topic_received = CharArrayToString(recv_buffer, 0, topic_len);
+        topic_received = CharArrayToString(recv_buffer, 0, topic_len, CP_UTF8);
 
+        // 2. بررسی اینکه آیا بخش دومی (بدنه پیام) وجود دارد یا خیر
         int rcvmore = 0;
-        ZmqSocketGet(g_zmq_socket_sub, ZMQ_RCVMORE, rcvmore);
+        // [اصلاح شده] فراخوانی صحیح ZmqSocketGet با دو پارامتر
+        if (ZmqSocketGet(g_zmq_socket_sub, ZMQ_RCVMORE, rcvmore) != 0)
+        {
+             // اگر دریافت آپشن ZMQ_RCVMORE با خطا مواجه شد
+             LogEvent("ERROR", "Failed to get ZMQ_RCVMORE option", ZmqErrno());
+             continue; // برو سراغ پیام بعدی (اگر وجود داشت)
+        }
 
-        if (!rcvmore) {
-            LogEvent("WARN", "Received topic '" + topic_received + "' but no message body");
+        // اگر بخش دومی نبود (پیام ناقص)، لاگ بنویس و ادامه بده
+        if (!rcvmore)
+        {
+            LogEvent("WARN", "Received topic '" + topic_received + "' but no message body", 0);
             continue;
         }
 
+        // 3. خواندن بخش دوم: بدنه پیام (JSON)
         int msg_len = ZmqRecv(g_zmq_socket_sub, recv_buffer, 4096, ZMQ_DONTWAIT);
-        if (msg_len <= 0) {
+        if (msg_len <= 0)
+        {
             LogEvent("WARN", "Message body read failed for topic '" + topic_received + "'", ZmqErrno());
             continue;
         }
 
-        json_message = CharArrayToString(recv_buffer, 0, msg_len);
+        json_message = CharArrayToString(recv_buffer, 0, msg_len, CP_UTF8);
 
-        LogEvent("INFO", "Received signal on topic '" + topic_received + "'");
+        // لاگ دریافت موفق و آپدیت زمان آخرین دریافت
+        // LogEvent("INFO", "Received signal on topic '" + topic_received + "'", 0); // لاگ فشرده شد
         g_last_recv_time = TimeCurrent();
 
+        // 4. ارسال پیام JSON برای پردازش
         ProcessSignal(topic_received, json_message);
     }
 }
-
+//+------------------------------------------------------------------+
 
 
 
@@ -845,7 +1116,7 @@ void RemoveFromMap(ulong ticket) {
         if (g_position_map[i].ticket == ticket) {
             ArrayCopy(g_position_map, g_position_map, i, i + 1);
             ArrayResize(g_position_map, ArraySize(g_position_map) - 1);
-            LogEvent("INFO", "Removed position from map", ticket);
+            LogEvent("INFO", "Removed position from map", (long)ticket);
             return;
         }
     }
@@ -875,7 +1146,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
     double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
     g_daily_dd += profit;
     
-    LogEvent("INFO", "Deal " + (string)trans.deal + " closed. Profit: " + DoubleToString(profit, 2) + ". New Daily DD total: " + DoubleToString(g_daily_dd, 2));
+    LogEvent("INFO", "Deal closed. Profit: " + DoubleToString(profit, 2) + ". New Daily DD total: " + DoubleToString(g_daily_dd, 2), (long)trans.deal);
 
     SendCloseReport(trans.deal);
 }
@@ -883,25 +1154,35 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 
 
 
+//+------------------------------------------------------------------+
+//| [بازنویسی شده] ارسال گزارش بسته شدن معامله به سرور
+//| و مدیریت افزودن به صف تلاش مجدد (uchar[]) در صورت خطا
+//+------------------------------------------------------------------+
+void SendCloseReport(ulong deal_ticket)
+{
+    // اگر سوکت PUSH معتبر نیست، خارج شو
+    if (g_zmq_socket_push == 0)
+        return;
 
-void SendCloseReport(ulong deal_ticket) {
-    if (g_zmq_socket_push == 0) return;
-
-    if (!HistoryDealSelect(deal_ticket)) {
-        LogEvent("ERROR", "Failed to select deal for report", deal_ticket);
+    // انتخاب دیل برای خواندن اطلاعات
+    if (!HistoryDealSelect(deal_ticket))
+    {
+        LogEvent("ERROR", "Failed to select deal for report", (long)deal_ticket);
         return;
     }
 
+    // استخراج اطلاعات source_id_str و source_ticket از کامنت
     string comment = HistoryDealGetString(deal_ticket, DEAL_COMMENT);
     string parts[];
     string source_id_str = "UNKNOWN";
     long source_ticket = 0;
-
-    if (StringSplit(comment, '|', parts) >= 2) {
+    if (StringSplit(comment, '|', parts) >= 2)
+    {
         source_ticket = (long)StringToInteger(parts[0]);
         source_id_str = parts[1];
     }
 
+    // ساخت پیام JSON
     g_json_builder.Init();
     g_json_builder.Add("event", "TRADE_CLOSED_COPY");
     g_json_builder.Add("copy_id_str", InpCopyIDStr);
@@ -910,92 +1191,148 @@ void SendCloseReport(ulong deal_ticket) {
     g_json_builder.Add("symbol", HistoryDealGetString(deal_ticket, DEAL_SYMBOL));
     g_json_builder.Add("profit", HistoryDealGetDouble(deal_ticket, DEAL_PROFIT));
     g_json_builder.Add("volume", HistoryDealGetDouble(deal_ticket, DEAL_VOLUME));
-    g_json_builder.Add("deal_ticket", (long)deal_ticket);
-
+    g_json_builder.Add("deal_ticket", (long)deal_ticket); // تیکت دیل کپی شده (برای دیباگ)
     string json_message = g_json_builder.ToString();
 
-    if (ZmqSendString(g_zmq_socket_push, json_message, ZMQ_DONTWAIT) == -1) {
+    // تبدیل پیام string به آرایه بایت uchar[]
+    uchar json_data[];
+    int data_len = StringToCharArray(json_message, json_data, 0, -1, CP_UTF8) - 1; // -1 for null terminator
+
+    // بررسی اندازه پیام قبل از ارسال یا افزودن به صف
+    if(data_len >= MAX_MSG_SIZE)
+    {
+        LogEvent("ERROR", "Close report JSON too large for retry queue", data_len);
+        return; // پیام خیلی بزرگ است، ارسال یا ذخیره نمی‌شود
+    }
+
+    // تلاش برای ارسال مستقیم بایت‌ها
+    if (ZmqSend(g_zmq_socket_push, json_data, data_len, ZMQ_DONTWAIT) == -1)
+    {
+        // اگر ارسال ناموفق بود، به صف تلاش مجدد اضافه کن
         LogEvent("ERROR", "Failed to send close report", ZmqErrno());
+
         int size = ArraySize(g_retry_queue);
         ArrayResize(g_retry_queue, size + 1);
-        g_retry_queue[size].json = json_message;
+
+        // ذخیره اطلاعات در struct جدید
         g_retry_queue[size].attempts = 0;
-    } else {
-        LogEvent("INFO", "Close report sent successfully");
+        g_retry_queue[size].data_len = data_len;
+        // کپی کردن داده‌های بایت به صف
+        ArrayCopy(g_retry_queue[size].json_data, json_data, 0, 0, data_len);
+    }
+    else
+    {
+        // اگر ارسال موفق بود، فقط لاگ کن
+        LogEvent("INFO", "Close report sent successfully", 0);
     }
 }
+//+------------------------------------------------------------------+
 
 
+//+------------------------------------------------------------------+
+//| [بازنویسی شده] ارسال گزارش خطا به سرور
+//| و مدیریت افزودن به صف تلاش مجدد (uchar[]) در صورت خطا
+//+------------------------------------------------------------------+
+void SendErrorReport(string error_msg)
+{
+    // اگر سوکت PUSH معتبر نیست، خارج شو
+    if (g_zmq_socket_push == 0)
+        return;
 
-
-
-void SendErrorReport(string error_msg) {
+    // ساخت پیام JSON
     g_json_builder.Init();
     g_json_builder.Add("event", "EA_ERROR");
     g_json_builder.Add("copy_id_str", InpCopyIDStr);
     g_json_builder.Add("message", error_msg);
-
     string json_message = g_json_builder.ToString();
 
-    if (ZmqSendString(g_zmq_socket_push, json_message, ZMQ_DONTWAIT) == -1) {
-        LogEvent("ERROR", "Failed to send error report", ZmqErrno());
-    } else {
-        LogEvent("INFO", "Error report sent: " + error_msg);
-    }
-}
+    // تبدیل پیام string به آرایه بایت uchar[]
+    uchar json_data[];
+    int data_len = StringToCharArray(json_message, json_data, 0, -1, CP_UTF8) - 1; // -1 for null terminator
 
-
-
-
-
-/******************************************************************
- * لاگ‌نویسی هوشمند رویدادها با قابلیت فیلتر کردن سطح لاگ
- ******************************************************************/
-void LogEvent(string level, string msg, variant extra = -1) {
-    // اگر لاگ از نوع اطلاعاتی بود و کاربر لاگ دیباگ را نخواسته بود، آن را نادیده بگیر
-    if (level == "INFO" && !InpEnableDebugLogging) {
+    // بررسی اندازه پیام قبل از ارسال یا افزودن به صف
+    if(data_len >= MAX_MSG_SIZE)
+    {
+        LogEvent("ERROR", "Error report JSON too large for retry queue", data_len);
+        // پیام‌های خطا معمولاً بزرگ نیستند، اما برای اطمینان چک می‌کنیم.
+        // اگر خیلی بزرگ بود، فقط لاگ می‌کنیم.
         return;
     }
 
-    datetime ts = TimeCurrent();
-    // شناسه کپی (CopyID) به لاگ اضافه شد تا مشخص شود کدام اکسپرت لاگ می‌زند
-    string log_str = TimeToString(ts, TIME_DATE|TIME_MINUTES|TIME_SECONDS) + " [" + level + "] [CopyEA-" + InpCopyIDStr + "]: " + msg;
+    // تلاش برای ارسال مستقیم بایت‌ها
+    if (ZmqSend(g_zmq_socket_push, json_data, data_len, ZMQ_DONTWAIT) == -1)
+    {
+        // اگر ارسال ناموفق بود، به صف تلاش مجدد اضافه کن
+        LogEvent("ERROR", "Failed to send error report", ZmqErrno());
 
-    if (extra != -1) {
-        log_str += " {" + VariantToString(extra) + "}";
+        int size = ArraySize(g_retry_queue);
+        // جلوگیری از پر شدن بیش از حد صف (مثلاً حداکثر ۱۰۰ پیام خطا)
+        if(size < 100)
+        {
+            ArrayResize(g_retry_queue, size + 1);
+            // ذخیره اطلاعات در struct جدید
+            g_retry_queue[size].attempts = 0;
+            g_retry_queue[size].data_len = data_len;
+            // کپی کردن داده‌های بایت به صف
+            ArrayCopy(g_retry_queue[size].json_data, json_data, 0, 0, data_len);
+        }
+        else
+        {
+            LogEvent("WARN", "Retry queue full, discarding new error report", size);
+        }
+    }
+    else
+    {
+        // اگر ارسال موفق بود، فقط لاگ کن (با پارامتر سوم 0)
+        LogEvent("INFO", "Error report sent: " + error_msg, 0);
+    }
+}
+//+------------------------------------------------------------------+
+
+
+
+
+
+//+------------------------------------------------------------------+
+//| [اصلاح شده] تابع لاگ‌نویسی هوشمند
+//| لاگ‌های INFO فقط در صورت فعال بودن دیباگ و همه لاگ‌ها در فایل ثبت می‌شوند
+//+------------------------------------------------------------------+
+void LogEvent(string level, string msg, long extra = -1) // پارامتر سوم اضافه شد
+{
+    // فیلتر کردن لاگ‌های INFO اگر دیباگ غیرفعال باشد
+    if (level == "INFO" && !InpEnableDebugLogging)
+    {
+        return;
     }
 
-    // فقط سطوح هشدار به بالا را در ترمینال چاپ کن تا خلوت بماند
-    if (level == "WARN" || level == "ERROR" || level == "CRITICAL") {
+    // ساخت رشته لاگ
+    datetime ts = TimeCurrent();
+    string log_str = TimeToString(ts, TIME_DATE|TIME_MINUTES|TIME_SECONDS) +
+                     " [" + level + "] [CopyEA-" + InpCopyIDStr + "]: " + msg;
+
+    if (extra != -1)
+    {
+        // تبدیل صریح عدد به رشته
+        log_str += " {" + IntegerToString(extra) + "}"; // استفاده از IntegerToString
+    }
+
+    // چاپ لاگ‌های مهم در ترمینال اکسپرت
+    if (level == "WARN" || level == "ERROR" || level == "CRITICAL")
+    {
         Print(log_str);
     }
 
-    // *تمام* لاگ‌ها (شامل INFO) را در فایل بنویس (با استفاده از هندل باز شده)
-    if(g_log_file_handle != INVALID_HANDLE) {
+    // نوشتن تمام لاگ‌های فعال در فایل
+    if(g_log_file_handle != INVALID_HANDLE)
+    {
         FileSeek(g_log_file_handle, 0, SEEK_END);
         FileWrite(g_log_file_handle, log_str + "\r\n");
     }
 
-    // اگر لاگ بحرانی بود، اکسپرت را متوقف کن
-    if (level == "CRITICAL") {
+    // توقف کامل اکسپرت در صورت بروز خطای بحرانی
+    if (level == "CRITICAL")
+    {
         ExpertRemove();
     }
 }
-
-
-
-
-
-/******************************************************************
- * تابع کمکی برای تبدیل انواع داده به رشته (برای لاگ)
- ******************************************************************/
-string VariantToString(variant v) {
-    if (typename(v) == "long" || typename(v) == "int") {
-        return "extra:" + IntegerToString((int)v);
-    } else if (typename(v) == "double") {
-        return "extra:" + DoubleToString((double)v, 2);
-    } else if (typename(v) == "string") {
-        return "extra:" + (string)v;
-    }
-    return "";
-}
+//+------------------------------------------------------------------+

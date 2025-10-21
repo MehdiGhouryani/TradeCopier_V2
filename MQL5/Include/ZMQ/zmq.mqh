@@ -2,7 +2,6 @@
 //
 // فایل هدر اصلی ZMQ برای MQL5
 // این فایل، فایل‌های هدر زمینه (Context) و سوکت (Socket) را فراخوانی می‌کند.
-
 #property strict
 
 #include "zmq_context.mqh"
@@ -29,6 +28,10 @@
 #define ZMQ_UNSUBSCRIBE           (7)
 #define ZMQ_TYPE                  (16)
 #define ZMQ_RCVMORE               (13)
+// [جدید] افزودن ثابت‌های High Water Mark
+#define ZMQ_SNDHWM                (23) // Send High Water Mark
+#define ZMQ_RCVHWM                (24) // Receive High Water Mark
+
 
 //--- ZMQ message
 #define ZMQ_DONTWAIT              (1)

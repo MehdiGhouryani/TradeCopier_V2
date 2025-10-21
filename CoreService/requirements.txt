@@ -4,5 +4,5 @@
 
 sqlalchemy       # برای مدیریت پایگاه داده (ORM)
 pyzmq            # برای ارتباطات لحظه‌ای (Real-time) با MQL5
-python-dotenv    # برای خواندن فایل .env
-python-telegram-bot # (در گام‌های بعدی اضافه خواهد شد)
+python-dotenv    # برای خواندن فایل .env (مانند توکن‌ها و تنظیمات)
+python-telegram-bot # برای پیاده‌سازی ربات ادمین تلگرام

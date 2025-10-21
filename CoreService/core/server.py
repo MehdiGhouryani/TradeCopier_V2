@@ -58,115 +58,174 @@ class ZMQServer:
                 await self.processing_queue.put(signal_data)
             except Exception as e:
                 logger.error(f"Error receiving signal: {e}")
+
+
+
+
     async def start_signal_processor(self):
-        """پردازش سیگنال‌های دریافتی از صف، ارسال به صف انتشار و ارسال هشدار به تلگرام."""
+        """پردازش سیگنال‌های دریافتی، انتشار لازم، ارسال هشدار تلگرام و مدیریت PING."""
         logger.info("Signal Processor task started. Waiting for signals...")
-        
+
         while True:
             signal_data = None
+            log_extra = {} # جزئیات اضافی برای لاگ‌نویسی هوشمند
+
             try:
                 signal_data = await self.processing_queue.get()
-                event_type = signal_data.get("event")
+                event_type = signal_data.get("event", "UNKNOWN_EVENT")
 
-                # جزئیات غنی برای لاگ‌نویسی فشرده
-                log_details = {
+                # --- استخراج جزئیات اولیه برای لاگ‌نویسی ---
+                log_extra = {
                     "event_type": event_type,
                     "source_id": signal_data.get("source_id_str"),
+                    "copy_id": signal_data.get("copy_id_str"),
                     "position_id": signal_data.get("position_id"),
                     "symbol": signal_data.get("symbol"),
-                    "copy_id": signal_data.get("copy_id_str"),
-                    "ea_id": signal_data.get("ea_id"),
+                    "ea_id": signal_data.get("ea_id", signal_data.get("source_id_str", signal_data.get("copy_id_str", "EA"))), # تشخیص هویت EA
                 }
-                
-                logger.info(f"Processing signal: {event_type}", extra=log_details)
 
-                # --- سیگنال‌های مستر (برای انتشار به کلاینت‌ها) ---
-                if event_type in ["TRADE_OPEN", "TRADE_MODIFY", "TRADE_CLOSE_MASTER"]:
+                logger.debug(f"Received signal from queue.", extra=log_extra) # لاگ اولیه دریافت
+
+                # --- مدیریت PING ---
+                if event_type == "PING" or event_type == "PING_COPY":
+                    ea_type = "SourceEA" if event_type == "PING" else "CopyEA"
+                    logger.info(f"{ea_type} ({log_extra['ea_id']}) is alive (PING received).", extra=log_extra)
+                    # برای PING کاری انجام نمی‌دهیم، فقط زنده بودن را ثبت می‌کنیم
+
+                # --- سیگنال‌های مستر (برای انتشار به کلاینت‌ها و هشدار تلگرام) ---
+                elif event_type in ["TRADE_OPEN", "TRADE_MODIFY", "TRADE_CLOSE_MASTER", "TRADE_PARTIAL_CLOSE_MASTER"]:
+                    logger.info(f"Processing Master signal: {event_type}", extra=log_extra)
                     await self.publish_queue.put(signal_data)
-                    logger.debug(f"Signal {event_type} put on publish_queue.", extra=log_details)
+                    logger.debug(f"Signal {event_type} put on publish_queue.", extra=log_extra)
 
+                    msg = None
                     if event_type == "TRADE_OPEN":
                         msg = (
                             f"✅ *سیگنال باز شدن*\n\n"
-                            f"▫️ *سورس:* `{signal_data.get('source_id_str')}`\n"
-                            f"▫️ *نماد:* `{signal_data.get('symbol')}`\n"
+                            f"▫️ *سورس:* `{log_extra['source_id']}`\n"
+                            f"▫️ *نماد:* `{log_extra['symbol']}`\n"
                             f"▫️ *نوع:* `{'BUY' if signal_data.get('position_type') == 0 else 'SELL'}`\n"
-                            f"▫️ *تیکت سورس:* `{signal_data.get('position_id')}`"
+                            f"▫️ *تیکت سورس:* `{log_extra['position_id']}`"
                         )
-                        await telegram_alert_queue.put(msg)
-                    
                     elif event_type == "TRADE_MODIFY":
-                        # --- بلوک جدید برای اطلاع‌رسانی اصلاح سیگنال ---
                         msg = (
                             f"🔄 *سیگنال اصلاح شد*\n\n"
-                            f"▫️ *سورس:* `{signal_data.get('source_id_str')}`\n"
-                            f"▫️ *نماد:* `{signal_data.get('symbol')}`\n"
-                            f"▫️ *تیکت سورس:* `{signal_data.get('position_id')}`\n"
+                            f"▫️ *سورس:* `{log_extra['source_id']}`\n"
+                            f"▫️ *نماد:* `{log_extra['symbol']}`\n"
+                            f"▫️ *تیکت سورس:* `{log_extra['position_id']}`\n"
                             f"▫️ *SL جدید:* `{signal_data.get('position_sl', 0.0):.5f}`\n"
                             f"▫️ *TP جدید:* `{signal_data.get('position_tp', 0.0):.5f}`"
                         )
-                        await telegram_alert_queue.put(msg)
-
                     elif event_type == "TRADE_CLOSE_MASTER":
                         msg = (
-                            f"☑️ *سیگنال بسته شدن (توسط مستر)*\n\n"
-                            f"▫️ *سورس:* `{signal_data.get('source_id_str')}`\n"
-                            f"▫️ *نماد:* `{signal_data.get('symbol')}`\n"
+                            f"☑️ *بسته شدن (توسط مستر)*\n\n"
+                            f"▫️ *سورس:* `{log_extra['source_id']}`\n"
+                            f"▫️ *نماد:* `{log_extra['symbol']}`\n"
                             f"▫️ *سود:* `{signal_data.get('profit', 0.0):.2f}`\n"
-                            f"▫️ *تیکت سورس:* `{signal_data.get('position_id')}`"
+                            f"▫️ *تیکت سورس:* `{log_extra['position_id']}`"
                         )
+                    elif event_type == "TRADE_PARTIAL_CLOSE_MASTER":
+                        msg = (
+                            f"✂️ *بسته شدن بخشی (توسط مستر)*\n\n"
+                            f"▫️ *سورس:* `{log_extra['source_id']}`\n"
+                            f"▫️ *نماد:* `{log_extra['symbol']}`\n"
+                            f"▫️ *حجم بسته شده:* `{signal_data.get('volume_closed', 0.0):.2f}`\n"
+                            f"▫️ *سود:* `{signal_data.get('profit', 0.0):.2f}`\n"
+                            f"▫️ *تیکت سورس:* `{log_extra['position_id']}`"
+                        )
+                        
+                    if msg and telegram_alert_queue:
                         await telegram_alert_queue.put(msg)
+                        logger.debug(f"Telegram alert sent for {event_type}.", extra=log_extra)
 
-                # --- گزارش‌های کلاینت کپی (برای ذخیره در دیتابیس) ---
+                # --- گزارش‌های کلاینت کپی (برای ذخیره در دیتابیس و هشدار تلگرام) ---
                 elif event_type == "TRADE_CLOSED_COPY":
+                    logger.info(f"Processing Copy close report.", extra=log_extra)
+                    profit = signal_data.get("profit", 0.0)
+                    source_ticket = signal_data.get("source_ticket")
+                    
+                    # --- ذخیره در دیتابیس با مدیریت خطای هوشمند ---
                     try:
                         database.save_trade_history(
-                            copy_id_str=signal_data.get("copy_id_str"),
-                            source_id_str=signal_data.get("source_id_str"),
-                            symbol=signal_data.get("symbol"),
-                            profit=signal_data.get("profit"),
-                            source_ticket=signal_data.get("source_ticket")
+                            copy_id_str=log_extra['copy_id'],
+                            source_id_str=log_extra['source_id'],
+                            symbol=log_extra['symbol'],
+                            profit=profit,
+                            source_ticket=source_ticket
                         )
-                        logger.info("Trade history saved to DB.", extra=log_details)
-                    except Exception as db_e:
-                        logger.error(f"Failed to save trade history to DB: {db_e}", exc_info=True, extra=log_details)
-                        # هشدار به ادمین در مورد عدم ذخیره در دیتابیس
-                        await telegram_alert_queue.put(f"🚨 *خطای دیتابیس*\n\n عدم موفقیت در ذخیره تاریخچه معامله: `{db_e}`")
-                    
-                    profit = signal_data.get("profit", 0.0)
+                        logger.info("Trade history saved to DB.", extra=log_extra)
+                    except ValueError as ve: # خطای مربوط به پیدا نشدن حساب
+                        logger.error(f"Failed to save trade history: {ve}", extra=log_extra)
+                        if telegram_alert_queue:
+                            await telegram_alert_queue.put(f"⚠️ *خطای ذخیره تاریخچه*\n\n{escape_markdown(str(ve), 2)}")
+                    except Exception as db_e: # سایر خطاهای دیتابیس
+                        logger.error(f"Critical DB error saving trade history: {db_e}", exc_info=True, extra=log_extra)
+                        if telegram_alert_queue:
+                            await telegram_alert_queue.put(f"🚨 *خطای شدید دیتابیس*\n\n عدم موفقیت در ذخیره تاریخچه معامله `{log_extra['copy_id']}` از سورس `{log_extra['source_id']}`. جزئیات در لاگ سرور.")
+
+                    # --- ارسال هشدار تلگرام ---
                     emoji = "🔻" if profit < 0 else "✅"
                     msg = (
                         f"{emoji} *معامله کپی شده بسته شد*\n\n"
-                        f"▫️ *حساب کپی:* `{signal_data.get('copy_id_str')}`\n"
-                        f"▫️ *سورس:* `{signal_data.get('source_id_str')}`\n"
-                        f"▫️ *نماد:* `{signal_data.get('symbol')}`\n"
+                        f"▫️ *حساب کپی:* `{log_extra['copy_id']}`\n"
+                        f"▫️ *سورس:* `{log_extra['source_id']}`\n"
+                        f"▫️ *نماد:* `{log_extra['symbol']}`\n"
                         f"▫️ *سود/زیان:* `{profit:.2f}`\n"
-                        f"▫️ *تیکت سورس:* `{signal_data.get('source_ticket')}`"
+                        f"▫️ *تیکت سورس:* `{source_ticket}`"
                     )
-                    await telegram_alert_queue.put(msg)
+                    if telegram_alert_queue:
+                        await telegram_alert_queue.put(msg)
+                        logger.debug("Telegram alert sent for TRADE_CLOSED_COPY.", extra=log_extra)
 
-                # --- خطاهای اکسپرت ---
+                # --- خطاهای اکسپرت (گزارش شده توسط EA) ---
                 elif event_type == "EA_ERROR":
-                    logger.warning(f"EA Error Reported: {signal_data.get('message')}", extra=log_details)
+                    error_message = signal_data.get('message', 'No details provided.')
+                    log_extra['error_message'] = error_message
+                    logger.warning(f"EA Error Reported from {log_extra['ea_id']}.", extra=log_extra)
                     msg = (
                         f"🚨 *خطای اکسپرت*\n\n"
-                        f"*{signal_data.get('ea_id', 'EA')}*:\n"
-                        f"`{signal_data.get('message')}`"
+                        f"*{log_extra['ea_id']}*:\n"
+                        f"`{escape_markdown(error_message, 2)}`"
                     )
-                    await telegram_alert_queue.put(msg)
-                
+                    if telegram_alert_queue:
+                        await telegram_alert_queue.put(msg)
+                        logger.debug("Telegram alert sent for EA_ERROR.", extra=log_extra)
+
                 # --- رویدادهای ناشناخته ---
                 else:
-                    logger.warning(f"Unknown event type received", extra=log_details)
+                    log_extra['raw_signal'] = signal_data # ثبت کل پیام ناشناخته
+                    logger.warning(f"Unknown event type received.", extra=log_extra)
+                    if telegram_alert_queue:
+                        # ارسال هشدار به ادمین در مورد رویداد ناشناخته
+                         await telegram_alert_queue.put(f"⚠️ *رویداد ناشناخته*\n\n سرور یک پیام با نوع `{event_type}` دریافت کرد که قادر به پردازش آن نیست. جزئیات در لاگ سرور.")
+
+
+            except json.JSONDecodeError as json_err:
+                # خطای خاص در پارس کردن JSON ورودی
+                log_extra['error'] = str(json_err)
+                log_extra['raw_signal_on_error'] = signal_data # signal_data اینجا ممکن است رشته خام باشد
+                logger.error("Failed to decode JSON signal.", extra=log_extra)
+                if telegram_alert_queue:
+                     await telegram_alert_queue.put("🚨 *خطای JSON*\n\n سرور پیامی دریافت کرد که قابل پارس کردن به عنوان JSON نبود. پیام خام در لاگ سرور ثبت شد.")
             
             except Exception as e:
                 # مدیریت خطای جامع برای کل فرآیند پردازش
-                log_details_on_error = {"failed_signal_data": signal_data}
-                logger.error(f"Critical error in signal processing task: {e}", exc_info=True, extra=log_details_on_error)
-            
+                log_extra['error'] = str(e)
+                log_extra['raw_signal_on_error'] = signal_data # ثبت داده‌ها هنگام خطا
+                logger.critical(f"Critical unhandled error in signal processing task: {e}", exc_info=True, extra=log_extra)
+                if telegram_alert_queue:
+                    # ارسال هشدار شدید به ادمین
+                     await telegram_alert_queue.put(f"🆘 *خطای بحرانی در پردازشگر سیگنال*\n\n خطای پیش‌بینی نشده: `{escape_markdown(str(e), 2)}`. لطفاً لاگ‌های سرور را فوراً بررسی کنید.")
+
             finally:
-                # تضمین می‌کند که صف همیشه خالی می‌شود
-                self.processing_queue.task_done()
+                # تضمین می‌کند که صف همیشه خالی می‌شود، حتی در صورت خطا
+                if self.processing_queue:
+                     self.processing_queue.task_done()
+
+
+
+
+
     async def start_signal_publisher(self):
         """انتشار سیگنال‌ها برای اکسپرت‌های اسلیو."""
         socket = self.context.socket(zmq.PUB)

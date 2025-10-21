@@ -354,9 +354,50 @@ void CheckSignalSocket() {
     }
 }
 
-void ProcessSignal(string source_topic, string json_message) {
+
+
+
+//+------------------------------------------------------------------+
+//| محاسبه مجموع سود/زیان شناور برای یک سورس خاص                     |
+//+------------------------------------------------------------------+
+double GetSourceFloatingProfitLoss(string source_id_str)
+{
+    double total_profit_loss = 0.0;
+    int map_size = ArraySize(g_position_map);
+    
+    for(int i = 0; i < map_size; i++)
+    {
+        if(g_position_map[i].source_id_str == source_id_str)
+        {
+            if(PositionSelectByTicket(g_position_map[i].ticket))
+            {
+                total_profit_loss += PositionGetDouble(POSITION_PROFIT);
+            }
+            else
+            {
+                LogEvent("WARN", "Position ticket not found during DD calculation, removing from map", g_position_map[i].ticket);
+                RemoveFromMap(g_position_map[i].ticket);
+                map_size--;
+                i--;
+            }
+        }
+    }
+    
+    return total_profit_loss;
+}
+
+
+
+
+
+//+------------------------------------------------------------------+
+//| پردازش سیگنال دریافت شده از سرور                                  |
+//+------------------------------------------------------------------+
+void ProcessSignal(string source_topic, string json_message)
+{
     CJAVal signal;
-    if (!signal.Deserialize(json_message)) {
+    if(!signal.Deserialize(json_message))
+    {
         LogEvent("ERROR", "Failed to deserialize signal JSON: " + json_message);
         return;
     }
@@ -366,15 +407,18 @@ void ProcessSignal(string source_topic, string json_message) {
 
     sSourceConfig config;
     bool config_found = false;
-    for (int i = 0; i < ArraySize(g_source_configs); i++) {
-        if (g_source_configs[i].SourceTopicID == source_topic) {
+    for(int i = 0; i < ArraySize(g_source_configs); i++)
+    {
+        if(g_source_configs[i].SourceTopicID == source_topic)
+        {
             config = g_source_configs[i];
             config_found = true;
             break;
         }
     }
 
-    if (!config_found) {
+    if(!config_found)
+    {
         LogEvent("WARN", "Signal from unconfigured source '" + source_topic + "'");
         return;
     }
@@ -387,35 +431,49 @@ void ProcessSignal(string source_topic, string json_message) {
     double tp = signal["position_tp"].ToDbl();
     long position_type = signal["position_type"].ToInt();
 
-    if (symbol == "" || volume <= 0) {
+    if(symbol == "" || (volume <= 0 && event_type == "TRADE_OPEN"))
+    {
         LogEvent("ERROR", "Invalid signal data: symbol or volume", symbol);
         return;
     }
 
-    if (!SymbolSelect(symbol, true)) {
+    if(!SymbolSelect(symbol, true))
+    {
         LogEvent("ERROR", "Symbol not found: " + symbol);
         return;
     }
 
-    if (config.CopyMode == "ALL") {
-    } else if (config.CopyMode == "GOLD_ONLY") {
-        if (StringFind(symbol, "XAU") < 0) {
+    if(config.CopyMode == "ALL")
+    {
+    }
+    else if(config.CopyMode == "GOLD_ONLY")
+    {
+        if(StringFind(symbol, "XAU") < 0)
+        {
             LogEvent("INFO", "Symbol filtered out (GOLD_ONLY): " + symbol);
             return;
         }
-    } else if (config.CopyMode == "SYMBOLS") {
-        if (StringFind(config.AllowedSymbols, symbol) < 0) {
+    }
+    else if(config.CopyMode == "SYMBOLS")
+    {
+        if(StringFind(config.AllowedSymbols, symbol) < 0)
+        {
             LogEvent("INFO", "Symbol filtered out (SYMBOLS): " + symbol);
             return;
         }
     }
 
     double final_volume;
-    if (config.VolumeType == "MULTIPLIER") {
+    if(config.VolumeType == "MULTIPLIER")
+    {
         final_volume = volume * config.VolumeValue;
-    } else if (config.VolumeType == "FIXED") {
+    }
+    else if(config.VolumeType == "FIXED")
+    {
         final_volume = config.VolumeValue;
-    } else {
+    }
+    else
+    {
         LogEvent("ERROR", "Invalid VolumeType: " + config.VolumeType);
         return;
     }
@@ -424,43 +482,55 @@ void ProcessSignal(string source_topic, string json_message) {
     double vol_min = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
     double vol_max = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
     final_volume = NormalizeDouble(final_volume / vol_step, 0) * vol_step;
-    if (final_volume < vol_min) final_volume = vol_min;
-    if (final_volume > vol_max) final_volume = vol_max;
+    if(final_volume < vol_min) final_volume = vol_min;
+    if(final_volume > vol_max) final_volume = vol_max;
 
-    if (config.MaxLotSize > 0 && final_volume > config.MaxLotSize) {
+    if(config.MaxLotSize > 0 && final_volume > config.MaxLotSize)
+    {
         LogEvent("WARN", "Volume exceeds MaxLotSize, capping", final_volume);
         final_volume = config.MaxLotSize;
     }
 
-    int concurrent = 0;
-    for (int i = 0; i < ArraySize(g_position_map); i++) {
-        if (g_position_map[i].source_id_str == source_topic) concurrent++;
-    }
-    if (config.MaxConcurrentTrades > 0 && concurrent >= config.MaxConcurrentTrades) {
-        LogEvent("WARN", "Max concurrent trades reached for source " + source_topic, concurrent);
-        return;
-    }
-
-    if (config.SourceDrawdownLimit > 0) {
-        LogEvent("WARN", "SourceDrawdownLimit not implemented yet");
-    }
-
-    CheckDailyDrawdown();
-
-    double point_value = SymbolInfoDouble(symbol, SYMBOL_POINT) * SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
-    double projected_profit = final_volume * point_value * (position_type == 0 ? (tp - price) : (price - tp));
-    if (g_daily_dd + projected_profit < -AccountEquity() * (g_global_config.DailyDrawdownPercent / 100.0)) {
-        LogEvent("WARN", "Trade rejected: exceeds daily DD limit", g_daily_dd + projected_profit);
-        return;
-    }
-
     string short_pos_id = IntegerToString((int)(source_pos_id % 100000000));
     string comment = short_pos_id + "|" + source_topic;
-    if (StringLen(comment) > 31) comment = StringSubstr(comment, 0, 31);
+    if(StringLen(comment) > 31) comment = StringSubstr(comment, 0, 31);
 
-    if (event_type == "TRADE_OPEN") {
+    if(event_type == "TRADE_OPEN")
+    {
+        int concurrent = 0;
+        for(int i = 0; i < ArraySize(g_position_map); i++)
+        {
+            if(g_position_map[i].source_id_str == source_topic) concurrent++;
+        }
+        if(config.MaxConcurrentTrades > 0 && concurrent >= config.MaxConcurrentTrades)
+        {
+            LogEvent("WARN", "Max concurrent trades reached for source " + source_topic, concurrent);
+            return;
+        }
+
+        if(config.SourceDrawdownLimit > 0.0)
+        {
+            double floating_pl = GetSourceFloatingProfitLoss(source_topic);
+            if(floating_pl < -config.SourceDrawdownLimit)
+            {
+                string err_msg = "SourceDrawdownLimit exceeded for " + source_topic + ", P/L: " + DoubleToString(floating_pl, 2);
+                LogEvent("WARN", "Trade rejected: " + err_msg);
+                SendErrorReport(err_msg);
+                return;
+            }
+        }
+
+        CheckDailyDrawdown();
+
+        double point_value = SymbolInfoDouble(symbol, SYMBOL_POINT) * SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+        double projected_profit = final_volume * point_value * (position_type == 0 ? (tp - price) : (price - tp));
+        if(g_daily_dd + projected_profit < -AccountEquity() * (g_global_config.DailyDrawdownPercent / 100.0))
+        {
+            LogEvent("WARN", "Trade rejected: exceeds daily DD limit", g_daily_dd + projected_profit);
+            return;
+        }
+
         LogEvent("INFO", "Executing OPEN: " + (position_type == 0 ? "BUY" : "SELL") + " " + symbol + " " + DoubleToString(final_volume, 2) + " lots from source " + source_topic);
-
         MqlTradeRequest req;
         ZeroMemory(req);
         req.action = TRADE_ACTION_DEAL;
@@ -473,23 +543,28 @@ void ProcessSignal(string source_topic, string json_message) {
         req.comment = comment;
 
         MqlTradeResult res;
-        if (!g_trade.OrderSend(req, res)) {
+        if(!g_trade.OrderSend(req, res))
+        {
             LogEvent("ERROR", "Open trade failed", res.retcode);
             SendErrorReport("Open failed: " + symbol);
             return;
-        } else {
-            LogEvent("INFO", "Open trade successful, ticket=" + IntegerToString((int)res.deal));
+        }
+        else
+        {
+            LogEvent("INFO", "Open trade successful, deal ticket=" + IntegerToString((int)res.deal) + ", position ticket=" + IntegerToString((int)res.position));
             int size = ArraySize(g_position_map);
             ArrayResize(g_position_map, size + 1);
-            g_position_map[size].ticket = res.deal;
+            g_position_map[size].ticket = res.position;
             g_position_map[size].source_pos_id = source_pos_id;
             g_position_map[size].source_id_str = source_topic;
         }
-    } else if (event_type == "TRADE_MODIFY") {
+    }
+    else if(event_type == "TRADE_MODIFY")
+    {
         LogEvent("INFO", "Executing MODIFY for position " + IntegerToString(source_pos_id) + " from source " + source_topic);
-
         ulong ticket = FindPositionBySourceID(source_pos_id);
-        if (ticket == 0) {
+        if(ticket == 0)
+        {
             LogEvent("WARN", "Position not found for modify: " + IntegerToString(source_pos_id));
             return;
         }
@@ -502,48 +577,68 @@ void ProcessSignal(string source_topic, string json_message) {
         req.tp = tp;
 
         MqlTradeResult res;
-        if (!g_trade.RequestExecute(req, res)) {
+        if(!g_trade.RequestExecute(req, res))
+        {
             LogEvent("ERROR", "Modify trade failed", res.retcode);
             SendErrorReport("Modify failed: " + symbol);
-        } else {
+        }
+        else
+        {
             LogEvent("INFO", "Modify successful for ticket " + IntegerToString((int)ticket));
         }
-    } else if (event_type == "TRADE_CLOSE_MASTER") {
+    }
+    else if(event_type == "TRADE_CLOSE_MASTER")
+    {
         LogEvent("INFO", "Executing CLOSE for position " + IntegerToString(source_pos_id) + " from source " + source_topic);
-
         ulong ticket = FindPositionBySourceID(source_pos_id);
-        if (ticket == 0) {
+        if(ticket == 0)
+        {
             LogEvent("WARN", "Position not found for close: " + IntegerToString(source_pos_id));
             return;
         }
 
-        if (!g_trade.PositionClose(ticket)) {
+        if(!g_trade.PositionClose(ticket))
+        {
             LogEvent("ERROR", "Close trade failed", g_trade.ResultRetcode());
             SendErrorReport("Close failed: " + symbol);
-        } else {
+        }
+        else
+        {
             LogEvent("INFO", "Close successful for ticket " + IntegerToString((int)ticket));
             RemoveFromMap(ticket);
         }
-    } else if (event_type == "TRADE_PARTIAL_CLOSE_MASTER") {
+    }
+    else if(event_type == "TRADE_PARTIAL_CLOSE_MASTER")
+    {
         double volume_closed = signal["volume_closed"].ToDbl();
         LogEvent("INFO", "Executing PARTIAL CLOSE for position " + IntegerToString(source_pos_id) + " volume " + DoubleToString(volume_closed, 2) + " from source " + source_topic);
-
         ulong ticket = FindPositionBySourceID(source_pos_id);
-        if (ticket == 0) {
+        if(ticket == 0)
+        {
             LogEvent("WARN", "Position not found for partial close: " + IntegerToString(source_pos_id));
             return;
         }
 
-        if (!g_trade.PositionClosePartial(ticket, volume_closed)) {
+        if(!g_trade.PositionClosePartial(ticket, volume_closed))
+        {
             LogEvent("ERROR", "Partial close failed", g_trade.ResultRetcode());
             SendErrorReport("Partial close failed: " + symbol);
-        } else {
+        }
+        else
+        {
             LogEvent("INFO", "Partial close successful for ticket " + IntegerToString((int)ticket));
         }
-    } else {
+    }
+    else
+    {
         LogEvent("WARN", "Unknown event type: " + event_type);
     }
 }
+
+
+
+
+
 
 void CheckDailyDrawdown() {
     if (TimeCurrent() - g_last_dd_reset >= 86400) {
@@ -596,17 +691,38 @@ void RemoveFromMap(ulong ticket) {
     }
 }
 
-void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result) {
-    if (trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
 
-    if ((ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY) != DEAL_ENTRY_OUT) return;
 
-    if (trans.magic != InpMagicNumber) return;
 
-    LogEvent("INFO", "Detected close deal, sending report", trans.deal);
+
+
+//+------------------------------------------------------------------+
+//| رویداد تراکنش ترید (برای گزارش‌دهی و محاسبه حد ضرر روزانه)         |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans,
+                        const MqlTradeRequest &request,
+                        const MqlTradeResult &result)
+{
+    if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
+        return;
+        
+    if((ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY) != DEAL_ENTRY_OUT)
+        return;
+
+    if(trans.magic != InpMagicNumber)
+        return;
+
+    double profit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
+    g_daily_dd += profit;
+    
+    LogEvent("INFO", "Deal " + (string)trans.deal + " closed. Profit: " + DoubleToString(profit, 2) + ". New Daily DD total: " + DoubleToString(g_daily_dd, 2));
 
     SendCloseReport(trans.deal);
 }
+
+
+
+
 
 void SendCloseReport(ulong deal_ticket) {
     if (g_zmq_socket_push == 0) return;
